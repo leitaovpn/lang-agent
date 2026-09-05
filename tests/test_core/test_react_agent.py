@@ -122,6 +122,39 @@ async def test_sqlite_checkpointer_persists_across_instances(tmp_path):
         assert isinstance(seen[-1], HumanMessage) and seen[-1].content == "第二问"
 
 
+async def test_loop_retries_on_invalid_tool_calls():
+    # 第一轮返回解析失败的 tool_call → 循环应附错误反馈并重试，最终给出回答
+    invalid = AIMessage(
+        content="",
+        invalid_tool_calls=[
+            {"name": "calculator", "args": "{bad", "id": None, "error": "JSON 解析失败"}
+        ],
+    )
+    loop, llm = make_loop([invalid, AIMessage(content="抱歉，我重新算：答案是 42")])
+    result = await loop.invoke("算一下 1+1", thread_id="t1")
+    assert result.final_text == "抱歉，我重新算：答案是 42"
+    # 第二轮 LLM 看到的历史里包含错误反馈 ToolMessage
+    seen = llm.seen_messages[1]
+    assert any(isinstance(m, ToolMessage) and "格式错误" in m.content for m in seen)
+
+
+async def test_loop_handles_duplicate_tool_call_ids():
+    calls = [
+        {"name": "calculator", "args": {"expression": "1+1"}, "id": "dup", "type": "tool_call"},
+        {"name": "calculator", "args": {"expression": "2+2"}, "id": "dup", "type": "tool_call"},
+    ]
+    loop, llm = make_loop([AIMessage(content="", tool_calls=calls), AIMessage(content="分别是 2 和 4")])
+    result = await loop.invoke("算两个", thread_id="t1")
+    assert result.final_text == "分别是 2 和 4"
+    # 第二轮 LLM 看到的历史满足不变式：tool_call_id 与 ToolMessage 一一对应且不重复
+    seen = llm.seen_messages[1]
+    ai = [m for m in seen if isinstance(m, AIMessage) and m.tool_calls][0]
+    ids = [c["id"] for c in ai.tool_calls]
+    assert len(ids) == len(set(ids)) == 2
+    tool_ids = [m.tool_call_id for m in seen if isinstance(m, ToolMessage)]
+    assert sorted(tool_ids) == sorted(ids)
+
+
 async def test_build_checkpointer_creates_missing_parent_dir(tmp_path):
     db_path = str(tmp_path / "nested" / "dir" / "ck.sqlite")
     config = AgentLoopConfig(checkpointer_kind="sqlite", db_path=db_path)

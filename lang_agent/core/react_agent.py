@@ -19,17 +19,19 @@ from typing import Annotated, Any, Optional, TypedDict, cast
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     AnyMessage,
     BaseMessage,
     BaseMessageChunk,
     HumanMessage,
     SystemMessage,
+    ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
-from langgraph.graph import START, StateGraph
+from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 
 from lang_agent.core.events import (
     EVENT_DONE,
@@ -40,6 +42,7 @@ from lang_agent.core.events import (
     classify_node_update,
     collect_tool_calls,
 )
+from lang_agent.core.repair import INVALID_ID_PREFIX, repair_messages_for_llm
 from lang_agent.core.tool_registry import instantiate_tools
 
 AGENT_NODE = "agent"
@@ -52,6 +55,23 @@ class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     system: str
     raw_input: str
+
+
+def should_continue(state: AgentState) -> str:
+    """循环条件：以最近一条 AIMessage 决定走向（工具结果/错误反馈由固定边处理）。
+
+    - 有合法 tool_calls → tools（执行工具）
+    - 只有 invalid_tool_calls（agent 节点已附错误反馈 ToolMessage）→ agent 重试
+    - 纯文本回答 → END
+    """
+    for message in reversed(state["messages"]):
+        if isinstance(message, AIMessage):
+            if message.tool_calls:
+                return TOOLS_NODE
+            if message.invalid_tool_calls:
+                return AGENT_NODE
+            return END
+    return END
 
 
 @dataclass
@@ -128,7 +148,9 @@ class AgentLoop:
             # agent 节点：流式调用 LLM 并合并 chunk，保证 token 级事件可被捕获。
             # 必须把 config 传给 astream：否则 bind_tools 的 RunnableBinding 内层
             # 模型收不到回调，token 级流式事件会丢失（langgraph 0.6 行为）。
-            messages: list[BaseMessage] = list(state["messages"])
+            # 发给 LLM 的历史先过修复层：保证每条 tool_call 都有对应 ToolMessage、
+            # tool_call_id 不重复（LLM 接口的硬性要求）。
+            messages: list[BaseMessage] = repair_messages_for_llm(list(state["messages"]))
             if state.get("system"):
                 messages = [SystemMessage(content=state["system"])] + messages
             chunks: list[BaseMessageChunk] = []
@@ -136,16 +158,31 @@ class AgentLoop:
                 chunks.append(cast(BaseMessageChunk, chunk))
             if not chunks:
                 return {"messages": []}
-            merged: BaseMessageChunk = chunks[0]
+            merged = cast(AIMessageChunk, chunks[0])
             for chunk in chunks[1:]:
-                merged = merged + chunk
-            return {"messages": [merged]}
+                merged = merged + cast(AIMessageChunk, chunk)
+            result: list[BaseMessage] = [merged]
+            if not merged.tool_calls:
+                # 无合法调用：为解析失败的调用附错误反馈 ToolMessage，驱动循环重试。
+                # id 与 repair 层的确定性 id 一致（invalid_<消息下标>_<条内序号>），
+                # 避免下一轮修复时重复合成。
+                base_index = len(state["messages"])
+                for k, invalid in enumerate(merged.invalid_tool_calls or []):
+                    result.append(
+                        ToolMessage(
+                            content="工具调用格式错误: %s"
+                            % (invalid.get("error") or "参数解析失败"),
+                            tool_call_id=f"{INVALID_ID_PREFIX}{base_index}_{k}",
+                            name=invalid.get("name") or "unknown_tool",
+                        )
+                    )
+            return {"messages": result}
 
         graph = StateGraph(AgentState)
         graph.add_node(AGENT_NODE, agent_node)
         graph.add_node(TOOLS_NODE, ToolNode(self._tools))
         graph.add_edge(START, AGENT_NODE)
-        graph.add_conditional_edges(AGENT_NODE, tools_condition)
+        graph.add_conditional_edges(AGENT_NODE, should_continue)
         graph.add_edge(TOOLS_NODE, AGENT_NODE)
         return graph.compile(checkpointer=self._checkpointer)
 

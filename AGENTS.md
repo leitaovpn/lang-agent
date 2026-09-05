@@ -29,7 +29,8 @@ lang-agent：基于 langgraph 的 lang agent，分三层：
 ## 架构要点
 
 - **State**：`AgentState` TypedDict，`messages: Annotated[list[AnyMessage], add_messages]`（`AnyMessage` 来自 langchain_core.messages，`add_messages` 来自 langgraph.graph.message），外加只读元数据字段 `system`、`raw_input`
-- **拓扑**：`START → agent（bind_tools + 流式合并 chunk）→ tools_condition → tools（ToolNode）/ END`，`tools → agent` 回环
+- **拓扑**：`START → agent（bind_tools + 流式合并 chunk）→ should_continue → tools（ToolNode）/ END / agent（重试）`，`tools → agent` 回环
+- **LLM 历史不变式**（`core/repair.py`）：发给 LLM 的每条历史必须满足「AIMessage 的每条 tool_call 后面都有对应 ToolMessage，tool_call_id 在**两个 AIMessage 之间**不重合」。agent 节点每次调用前先过 `repair_messages_for_llm`（只修拷贝不改 state）；**只修最后一条 AIMessage 起的尾部**——历史由本循环追加且每次都先修复，LLM 能回复新 AIMessage 即证明前缀正确（归纳不变式），前缀的 tool_call_id 完全不参与处理。尾部缺结果合成错误 ToolMessage、重复/孤儿丢弃、尾部内重复 id 改名、invalid_tool_calls 合成错误反馈；`should_continue` 看到只有 invalid_tool_calls 的 AIMessage 会带反馈回 agent 重试
 - **流式**：`graph.astream(stream_mode=["messages", "updates"])` 双通道——messages 给 token 级文本（metadata 按 `langgraph_node` 过滤），updates 给完整 AIMessage（tool_call）与 ToolMessage（tool_result）；事件分类是 `core/events.py` 的纯函数
 - **多轮记忆**：`thread_id` + checkpointer。默认 sqlite（`AsyncSqliteSaver`，重启不丢），`memory` 兜底（`InMemorySaver`）。**sqlite 只能在异步上下文创建**：`await build_checkpointer(config)` 后注入 `AgentLoop(..., checkpointer=...)`，直接构造会抛 ValueError
 - **测试设施**：`tests/` 镜像包结构；LLM 一律用 `tests/conftest.py` 的 `FakeChatModel`（脚本队列驱动，`bind_tools` 返回真实 RunnableBinding），**测试不得依赖真实 API key**；agent 层接口测试用 httpx `ASGITransport` + `app.dependency_overrides`

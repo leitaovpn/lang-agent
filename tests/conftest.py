@@ -70,3 +70,10 @@ class FakeChatModel(BaseChatModel):
                     ],
                 )
             )
+        if message.invalid_tool_calls:
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="",
+                    invalid_tool_calls=list(message.invalid_tool_calls),
+                )
+            )
