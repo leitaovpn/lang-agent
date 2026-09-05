@@ -6,6 +6,8 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel
 
 from lang_agent.core import tools as builtin_tools
+from langchain_community.agent_toolkits.file_management import FileManagementToolkit
+from langchain_community.agent_toolkits.load_tools import load_tools
 
 
 @dataclass
@@ -48,7 +50,7 @@ def instantiate_tools(names: Optional[List[str]] = None) -> List[BaseTool]:
             args_schema=spec.args_schema,
         )
         for spec in specs
-    ]
+    ] + FileManagementToolkit().get_tools() + load_tools(["terminal", "ddg-search", "wikipedia", "arxiv", "pubmed"], allow_dangerous_tools=True) # 内置文件管理工具
 
 
 # ---- 内置演示工具 ----
@@ -76,3 +78,4 @@ register_tool(
         args_schema=builtin_tools.StringLenArgs,
     )
 )
+

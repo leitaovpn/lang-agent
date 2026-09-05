@@ -111,8 +111,13 @@ class AgentLoop:
                 "sqlite checkpointer 必须在异步上下文中创建："
                 "请先 await build_checkpointer(config) 再注入 checkpointer 参数"
             )
-        self._tools = tools if tools is not None else instantiate_tools()
+        self._tools = self._build_tools(tools)
         self._graph = self._build_graph()
+
+    def _build_tools(self, tools:  Optional[list[BaseTool]] = None) -> list[BaseTool]:
+        """按配置构建工具列表（可被子类覆盖）。"""
+        default_tools = instantiate_tools()
+        return default_tools + (tools or [])
 
     def _build_graph(self):
         model = self._llm.bind_tools(self._tools)
