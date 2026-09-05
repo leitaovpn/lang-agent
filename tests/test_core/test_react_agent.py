@@ -351,6 +351,64 @@ async def test_stream_ends_with_error_event_after_exhaustion():
     assert "持续超时" in events[-1].data["message"]
 
 
+# ---- ToolNode 异常语义锁定：工具异常/未知工具 → 错误 ToolMessage 投喂 LLM，不抛出 ----
+
+
+async def test_tool_execution_error_feeds_error_to_llm():
+    # 工具执行异常（除零）：ToolNode 捕获后以错误 ToolMessage 投喂 LLM，循环继续
+    calls = [
+        {"name": "calculator", "args": {"expression": "1/0"}, "id": "c1", "type": "tool_call"}
+    ]
+    loop, _ = make_loop([AIMessage(content="", tool_calls=calls), AIMessage(content="除零失败，换个算法")])
+    result = await loop.invoke("1 除以 0", thread_id="t1")
+    assert result.final_text == "除零失败，换个算法"
+    tool_msgs = [m for m in result.messages if isinstance(m, ToolMessage)]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0].tool_call_id == "c1"
+    assert "无法计算" in tool_msgs[0].content or "division by zero" in tool_msgs[0].content
+    assert tool_msgs[0].status == "error"
+
+
+async def test_unknown_tool_feeds_error_to_llm():
+    # LLM 调用 ToolNode 范围外的工具：返回含报错信息的 ToolMessage，循环继续
+    calls = [
+        {"name": "no_such_tool", "args": {"x": 1}, "id": "c1", "type": "tool_call"}
+    ]
+    loop, _ = make_loop([AIMessage(content="", tool_calls=calls), AIMessage(content="没有这个工具，我直接回答")])
+    result = await loop.invoke("用不存在的工具", thread_id="t1")
+    assert result.final_text == "没有这个工具，我直接回答"
+    tool_msgs = [m for m in result.messages if isinstance(m, ToolMessage)]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0].tool_call_id == "c1"
+    assert "not a valid tool" in tool_msgs[0].content
+
+
+async def test_stream_tool_execution_error_feeds_error_to_llm():
+    calls = [
+        {"name": "calculator", "args": {"expression": "1/0"}, "id": "c1", "type": "tool_call"}
+    ]
+    loop, _ = make_loop([AIMessage(content="", tool_calls=calls), AIMessage(content="除零失败，换个算法")])
+    events = [event async for event in loop.stream("1 除以 0", thread_id="t1")]
+    types = [e.type for e in events]
+    assert types.index("tool_call") < types.index("tool_result") < types.index("done")
+    tool_result = next(e for e in events if e.type == "tool_result")
+    assert "无法计算" in tool_result.data["content"] or "division by zero" in tool_result.data["content"]
+    assert events[-1].data["final_text"] == "除零失败，换个算法"
+
+
+async def test_stream_unknown_tool_feeds_error_to_llm():
+    calls = [
+        {"name": "no_such_tool", "args": {"x": 1}, "id": "c1", "type": "tool_call"}
+    ]
+    loop, _ = make_loop([AIMessage(content="", tool_calls=calls), AIMessage(content="没有这个工具，我直接回答")])
+    events = [event async for event in loop.stream("用不存在的工具", thread_id="t1")]
+    types = [e.type for e in events]
+    assert types.index("tool_call") < types.index("tool_result") < types.index("done")
+    tool_result = next(e for e in events if e.type == "tool_result")
+    assert "not a valid tool" in tool_result.data["content"]
+    assert events[-1].data["final_text"] == "没有这个工具，我直接回答"
+
+
 async def test_build_checkpointer_creates_missing_parent_dir(tmp_path):
     db_path = str(tmp_path / "nested" / "dir" / "ck.sqlite")
     config = AgentLoopConfig(checkpointer_kind="sqlite", db_path=db_path)
