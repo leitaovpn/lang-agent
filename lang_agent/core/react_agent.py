@@ -41,6 +41,7 @@ from lang_agent.core.events import (
     classify_message_chunk,
     classify_node_update,
     collect_tool_calls,
+    messages_after_last_human,
 )
 from lang_agent.core.repair import INVALID_ID_PREFIX, repair_messages_for_llm
 from lang_agent.core.tool_registry import instantiate_tools
@@ -161,13 +162,13 @@ class AgentLoop:
             merged = cast(AIMessageChunk, chunks[0])
             for chunk in chunks[1:]:
                 merged = merged + cast(AIMessageChunk, chunk)
-            result: list[BaseMessage] = [merged]
-            if not merged.tool_calls:
+            result: list[BaseMessage] = [merged]  # type: ignore    
+            if not merged.tool_calls:  # type: ignore    
                 # 无合法调用：为解析失败的调用附错误反馈 ToolMessage，驱动循环重试。
                 # id 与 repair 层的确定性 id 一致（invalid_<消息下标>_<条内序号>），
                 # 避免下一轮修复时重复合成。
                 base_index = len(state["messages"])
-                for k, invalid in enumerate(merged.invalid_tool_calls or []):
+                for k, invalid in enumerate(merged.invalid_tool_calls or []):  # type: ignore    
                     result.append(
                         ToolMessage(
                             content="工具调用格式错误: %s"
@@ -205,21 +206,25 @@ class AgentLoop:
     async def invoke(
         self, query: str, *, thread_id: str, system: Optional[str] = None
     ) -> ConversationResult:
-        """同步语义的一次调用：返回最终文本、完整消息历史与工具调用汇总。"""
+        """同步语义的一次调用：返回最终文本、本轮消息与工具调用汇总。
+
+        messages 与 tool_calls 都只含本轮（最后一条 HumanMessage 起）产生的内容，
+        不含该 thread 的历史轮次。
+        """
         state = await self._graph.ainvoke(
             cast(AgentState, self._initial_state(query, system)), self._run_config(thread_id)
         )
-        messages: list[BaseMessage] = state["messages"]
+        round_messages = messages_after_last_human(state["messages"])
         final_text = ""
-        for message in reversed(messages):
+        for message in reversed(round_messages):
             if isinstance(message, AIMessage) and isinstance(message.content, str) and message.content:
                 final_text = message.content
                 break
         return ConversationResult(
             thread_id=thread_id,
             final_text=final_text,
-            messages=messages,
-            tool_calls=collect_tool_calls(messages),
+            messages=round_messages,
+            tool_calls=collect_tool_calls(round_messages),
         )
 
     async def stream(
@@ -258,7 +263,10 @@ class AgentLoop:
                         for event in classify_node_update(node, delta):
                             yield event
             state = await self._graph.aget_state(self._run_config(thread_id))
-            tool_calls = collect_tool_calls(state.values.get("messages", []))
+            # 只汇总本轮（最后一条 HumanMessage 起）的 tool_calls，不含历史轮次
+            tool_calls = collect_tool_calls(
+                messages_after_last_human(state.values.get("messages", []))
+            )
             yield AgentEvent(
                 EVENT_DONE,
                 {

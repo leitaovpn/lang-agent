@@ -11,7 +11,13 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+)
 
 EVENT_LLM_TOKEN = "llm_token"
 EVENT_TOOL_CALL = "tool_call"
@@ -35,7 +41,7 @@ class AgentEvent:
 
 @dataclass
 class ConversationResult:
-    """invoke() 的同步结果。"""
+    """invoke() 的同步结果。messages 与 tool_calls 都只含本轮（最后一条 HumanMessage 起）产生的内容。"""
 
     thread_id: str
     final_text: str
@@ -84,8 +90,20 @@ def classify_node_update(node: str, delta: Dict[str, Any]) -> List[AgentEvent]:
     return events
 
 
+def messages_after_last_human(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """截取最近一条 HumanMessage 起的本轮消息（含其后的 AIMessage/ToolMessage）。
+
+    每次 invoke 都会追加一条新的 HumanMessage，因此最后一条 HumanMessage
+    就是本轮循环的起点；之前的轮次不参与本轮汇总。
+    """
+    for idx in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[idx], HumanMessage):
+            return messages[idx:]
+    return messages
+
+
 def collect_tool_calls(messages: List[BaseMessage]) -> List[Dict[str, Any]]:
-    """从消息历史中汇总所有 AIMessage 发起过的工具调用。"""
+    """汇总给定消息范围内 AIMessage 发起过的工具调用（调用方负责传本轮切片）。"""
     tool_calls: List[Dict[str, Any]] = []
     for message in messages:
         if isinstance(message, AIMessage):

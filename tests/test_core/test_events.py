@@ -1,11 +1,27 @@
 """事件分类纯函数与 SSE 序列化测试。"""
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from lang_agent.core.events import (
     AgentEvent,
     classify_message_chunk,
     classify_node_update,
+    messages_after_last_human,
 )
+
+
+def test_messages_after_last_human_slices_current_round():
+    messages = [
+        HumanMessage(content="第一问"),
+        AIMessage(content="第一答"),
+        HumanMessage(content="第二问"),
+        AIMessage(content="第二答"),
+    ]
+    assert messages_after_last_human(messages) == messages[2:]
+
+
+def test_messages_after_last_human_without_human_returns_all():
+    messages = [AIMessage(content="答")]
+    assert messages_after_last_human(messages) == messages
 
 
 def test_token_from_agent_chunk():

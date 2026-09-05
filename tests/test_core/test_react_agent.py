@@ -122,6 +122,51 @@ async def test_sqlite_checkpointer_persists_across_instances(tmp_path):
         assert isinstance(seen[-1], HumanMessage) and seen[-1].content == "第二问"
 
 
+async def test_tool_calls_only_summarize_current_round():
+    # 第一轮触发工具调用，第二轮纯文本：第二轮结果不应包含第一轮的 tool_calls
+    loop, _ = make_loop(
+        [
+            AIMessage(content="", tool_calls=[TOOL_CALL]),   # 第 1 轮
+            AIMessage(content="结果是 56"),                    # 第 1 轮
+            AIMessage(content="好的，没问题"),                  # 第 2 轮
+        ],
+        checkpointer=InMemorySaver(),
+    )
+    first = await loop.invoke("计算 (3+5)*7", thread_id="t1")
+    assert [tc["name"] for tc in first.tool_calls] == ["calculator"]
+
+    second = await loop.invoke("谢谢", thread_id="t1")
+    assert second.tool_calls == []
+
+
+async def test_result_messages_only_current_round():
+    loop, _ = make_loop(
+        [AIMessage(content="第一答"), AIMessage(content="第二答")],
+        checkpointer=InMemorySaver(),
+    )
+    first = await loop.invoke("第一问", thread_id="t1")
+    assert [m.content for m in first.messages] == ["第一问", "第一答"]
+
+    second = await loop.invoke("第二问", thread_id="t1")
+    assert [m.content for m in second.messages] == ["第二问", "第二答"]
+
+
+async def test_stream_done_only_summarizes_current_round_tool_calls():
+    loop, _ = make_loop(
+        [
+            AIMessage(content="", tool_calls=[TOOL_CALL]),
+            AIMessage(content="结果是 56"),
+            AIMessage(content="好的"),
+        ],
+        checkpointer=InMemorySaver(),
+    )
+    await loop.invoke("计算 (3+5)*7", thread_id="t1")
+    events = [event async for event in loop.stream("谢谢", thread_id="t1")]
+    done = events[-1]
+    assert done.type == "done"
+    assert done.data["tool_calls"] == []
+
+
 async def test_loop_retries_on_invalid_tool_calls():
     # 第一轮返回解析失败的 tool_call → 循环应附错误反馈并重试，最终给出回答
     invalid = AIMessage(
