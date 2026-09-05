@@ -229,11 +229,12 @@ async def test_loop_completes_with_duplicate_tool_call_ids():
     assert [c["id"] for c in ai.tool_calls] == ["dup", "dup"]
 
 
-def make_flaky_loop(script, *, fail_times=1, error_factory=None, error=None, config=None):
+def make_flaky_loop(script, *, fail_times=1, fail_at=None, error_factory=None, error=None, config=None):
     """构造 FlakyChatModel 驱动的 loop；测试用 retry_base_delay=0 避免真实等待。"""
     flaky = FlakyChatModel(
         responses=list(script),
         fail_times=fail_times,
+        fail_at=fail_at,
         error=error,
         error_factory=error_factory,
     )
@@ -288,6 +289,54 @@ async def test_stream_retries_transient_error_and_finishes_done():
     assert events[-1].type == "done"
     assert events[-1].data["final_text"] == "结果是 56"
     assert flaky.calls == 2
+
+
+async def test_retry_resume_repairs_mid_run_broken_messages():
+    # 第 1 次调用返回重复 id 的 tool_call（中途产生坏段），第 2 次调用瞬时失败，
+    # 续跑前的修复必须让续跑调用看到 tool_call id 唯一、ToolMessage 一一对应的历史。
+    # 注意：失败的调用在 _generate 之前就抛异常，不记入 seen_messages。
+    dup_calls = [
+        {"name": "calculator", "args": {"expression": "1+1"}, "id": "dup", "type": "tool_call"},
+        {"name": "calculator", "args": {"expression": "2+2"}, "id": "dup", "type": "tool_call"},
+    ]
+    loop, flaky = make_flaky_loop(
+        [AIMessage(content="", tool_calls=dup_calls), AIMessage(content="答案是 X")],
+        fail_times=0,
+        fail_at=2,
+        error_factory=lambda: RetryableError("第二轮流式中断"),
+    )
+    result = await loop.invoke("算两个", thread_id="t1")
+    assert result.final_text == "答案是 X"
+    assert flaky.calls == 3
+    # seen[0]：第 1 次调用（只看到用户消息）；seen[1]：续跑调用（看到修复后的历史）
+    resumed = flaky.seen_messages[1]
+    ai_resumed = [m for m in resumed if isinstance(m, AIMessage) and m.tool_calls][0]
+    ids = [c["id"] for c in ai_resumed.tool_calls]
+    assert len(ids) == len(set(ids)) == 2
+    tool_ids = [m.tool_call_id for m in resumed if isinstance(m, ToolMessage)]
+    assert sorted(tool_ids) == sorted(ids)
+
+
+async def test_stream_retry_resume_repairs_mid_run_broken_messages():
+    dup_calls = [
+        {"name": "calculator", "args": {"expression": "1+1"}, "id": "dup", "type": "tool_call"},
+        {"name": "calculator", "args": {"expression": "2+2"}, "id": "dup", "type": "tool_call"},
+    ]
+    loop, flaky = make_flaky_loop(
+        [AIMessage(content="", tool_calls=dup_calls), AIMessage(content="答案是 X")],
+        fail_times=0,
+        fail_at=2,
+        error_factory=lambda: RetryableError("第二轮流式中断"),
+    )
+    events = [event async for event in loop.stream("算两个", thread_id="t1")]
+    assert events[-1].type == "done"
+    assert events[-1].data["final_text"] == "答案是 X"
+    resumed = flaky.seen_messages[1]
+    ai_resumed = [m for m in resumed if isinstance(m, AIMessage) and m.tool_calls][0]
+    ids = [c["id"] for c in ai_resumed.tool_calls]
+    assert len(ids) == len(set(ids)) == 2
+    tool_ids = [m.tool_call_id for m in resumed if isinstance(m, ToolMessage)]
+    assert sorted(tool_ids) == sorted(ids)
 
 
 async def test_stream_ends_with_error_event_after_exhaustion():

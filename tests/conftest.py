@@ -80,19 +80,20 @@ class FakeChatModel(BaseChatModel):
 
 
 class FlakyChatModel(FakeChatModel):
-    """可配置故障 fake：前 fail_times 次 _stream 抛 error，之后按脚本应答。
-
-    用于重试机制测试；调用次数记入 calls。
+    """可配置故障 fake：fail_times 前 N 次调用抛 error，fail_at 指定第 N 次调用抛 error，
+    其余按脚本应答。用于重试机制测试；调用次数记入 calls。
     """
 
     fail_times: int = 1
-    error: Any = None  # 每次抛的异常实例由 default_factory 生成更稳，这里用类/工厂
+    fail_at: Optional[int] = None  # 指定第 N 次（1 起）调用失败，用于「中途失败」场景
+    error: Any = None
     error_factory: Any = None
     calls: int = 0
 
     def _stream(self, messages, stop=None, run_manager=None, **kwargs):
         self.calls += 1
-        if self.calls <= self.fail_times:
+        should_fail = self.calls <= self.fail_times or self.calls == self.fail_at
+        if should_fail:
             error = self.error_factory() if self.error_factory else (self.error or RuntimeError("模型挂了"))
             raise error
         yield from super()._stream(messages, stop=stop, run_manager=run_manager, **kwargs)

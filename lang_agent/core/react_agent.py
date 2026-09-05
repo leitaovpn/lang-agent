@@ -267,12 +267,16 @@ class AgentLoop:
         )
         await asyncio.sleep(delay)
 
-    async def _resume_input(self, config: RunnableConfig, initial: Any) -> Any:
-        """重试输入：checkpoint 有 pending 任务 → input=None 从 checkpoint 续跑
-        （失败的超步重执行，输入消息不会重复追加）；尚无 checkpoint（首步即
-        失败）→ 复用原输入。"""
+    async def _resume_input(
+        self, thread_id: str, config: RunnableConfig, initial: Any
+    ) -> Any:
+        """重试输入：checkpoint 有 pending 任务 → 先修复 checkpoint 里的消息
+        （本轮中途产生的坏段在入口修复之后才写入，续跑前必须修掉，否则 agent
+        节点会拿到未修复的历史），再 input=None 从 checkpoint 续跑（失败的超步
+        重执行，输入消息不会重复追加）；尚无 checkpoint（首步即失败）→ 复用原输入。"""
         state = await self._graph.aget_state(config)
         if state.next or state.values:
+            await self._repair_checkpoint_state(thread_id)
             return None
         return initial
 
@@ -290,7 +294,9 @@ class AgentLoop:
         attempt = 0
         while True:
             attempt += 1
-            graph_input = initial if attempt == 1 else await self._resume_input(config, initial)
+            graph_input = (
+                initial if attempt == 1 else await self._resume_input(thread_id, config, initial)
+            )
             try:
                 state = await self._graph.ainvoke(graph_input, config)
                 break
@@ -328,7 +334,9 @@ class AgentLoop:
             attempt = 0
             while True:
                 attempt += 1
-                graph_input = initial if attempt == 1 else await self._resume_input(config, initial)
+                graph_input = (
+                initial if attempt == 1 else await self._resume_input(thread_id, config, initial)
+            )
                 try:
                     async for mode, payload in self._graph.astream(
                         graph_input,
