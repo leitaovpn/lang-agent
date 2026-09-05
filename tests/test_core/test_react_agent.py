@@ -4,7 +4,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from lang_agent.core.react_agent import AgentLoop, AgentLoopConfig, build_checkpointer
-from tests.conftest import FakeChatModel
+from lang_agent.core.retry import RetryableError
+from tests.conftest import FakeChatModel, FlakyChatModel
 
 TOOL_CALL = {
     "name": "calculator",
@@ -226,6 +227,79 @@ async def test_loop_completes_with_duplicate_tool_call_ids():
     seen = llm.seen_messages[1]
     ai = [m for m in seen if isinstance(m, AIMessage) and m.tool_calls][0]
     assert [c["id"] for c in ai.tool_calls] == ["dup", "dup"]
+
+
+def make_flaky_loop(script, *, fail_times=1, error_factory=None, error=None, config=None):
+    """构造 FlakyChatModel 驱动的 loop；测试用 retry_base_delay=0 避免真实等待。"""
+    flaky = FlakyChatModel(
+        responses=list(script),
+        fail_times=fail_times,
+        error=error,
+        error_factory=error_factory,
+    )
+    cfg = config or AgentLoopConfig(retry_base_delay=0)
+    return AgentLoop(llm=flaky, config=cfg, checkpointer=InMemorySaver()), flaky
+
+
+async def test_invoke_retries_transient_error_without_duplicate_messages():
+    loop, flaky = make_flaky_loop(
+        [AIMessage(content="答案是 42")],
+        fail_times=1,
+        error_factory=lambda: RetryableError("瞬时限流"),
+    )
+    result = await loop.invoke("1+1 等于几", thread_id="t1")
+    assert result.final_text == "答案是 42"
+    # 重试从 checkpoint 续跑：失败的超步重执行，输入消息不重复追加
+    assert flaky.calls == 2
+    for seen in flaky.seen_messages:
+        humans = [m for m in seen if isinstance(m, HumanMessage)]
+        assert len(humans) == 1 and humans[0].content == "1+1 等于几"
+
+
+async def test_invoke_raises_after_max_attempts():
+    loop, flaky = make_flaky_loop(
+        [AIMessage(content="不会用到")],
+        fail_times=10,
+        error_factory=lambda: RetryableError("持续限流"),
+        config=AgentLoopConfig(retry_base_delay=0, retry_max_attempts=3),
+    )
+    with pytest.raises(RetryableError):
+        await loop.invoke("问", thread_id="t1")
+    assert flaky.calls == 3
+
+
+async def test_invoke_non_retryable_error_raises_immediately():
+    loop, flaky = make_flaky_loop(
+        [AIMessage(content="不会用到")],
+        error_factory=lambda: RuntimeError("确定性错误"),
+    )
+    with pytest.raises(RuntimeError):
+        await loop.invoke("问", thread_id="t1")
+    assert flaky.calls == 1
+
+
+async def test_stream_retries_transient_error_and_finishes_done():
+    loop, flaky = make_flaky_loop(
+        [AIMessage(content="结果是 56")],
+        fail_times=1,
+        error_factory=lambda: RetryableError("瞬时超时"),
+    )
+    events = [event async for event in loop.stream("计算", thread_id="t1")]
+    assert events[-1].type == "done"
+    assert events[-1].data["final_text"] == "结果是 56"
+    assert flaky.calls == 2
+
+
+async def test_stream_ends_with_error_event_after_exhaustion():
+    loop, _ = make_flaky_loop(
+        [AIMessage(content="不会用到")],
+        fail_times=10,
+        error_factory=lambda: RetryableError("持续超时"),
+        config=AgentLoopConfig(retry_base_delay=0, retry_max_attempts=2),
+    )
+    events = [event async for event in loop.stream("问", thread_id="t1")]
+    assert events[-1].type == "error"
+    assert "持续超时" in events[-1].data["message"]
 
 
 async def test_build_checkpointer_creates_missing_parent_dir(tmp_path):

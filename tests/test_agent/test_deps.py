@@ -16,6 +16,14 @@ def test_loop_config_kind():
     assert isinstance(cfg, AgentLoopConfig)
 
 
+def test_loop_config_injects_openai_transient_exceptions():
+    from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+
+    cfg = app_config.loop_config()
+    injected = set(cfg.retryable_exceptions or ())
+    assert {APIConnectionError, APITimeoutError, InternalServerError, RateLimitError} <= injected
+
+
 def test_loop_config_respects_env(monkeypatch):
     monkeypatch.setenv("LANG_AGENT_CHECKPOINTER", "memory")
     cfg = app_config.loop_config()

@@ -15,6 +15,8 @@ invoke/stream 入口先做 _repair_checkpoint_state：修复并写回 checkpoint
 注意：本模块不能使用 `from __future__ import annotations`——langgraph 会用本模块的
 globals 求值 AgentState 的 `Annotated[...]` 注解，字符串化会导致 NameError。
 """
+import asyncio
+import logging
 import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -49,6 +51,7 @@ from lang_agent.core.events import (
     messages_after_last_human,
 )
 from lang_agent.core.repair import INVALID_ID_PREFIX, repair_state_for_checkpoint
+from lang_agent.core.retry import compute_delay, is_retryable
 from lang_agent.core.tool_registry import instantiate_tools
 
 AGENT_NODE = "agent"
@@ -85,6 +88,11 @@ class AgentLoopConfig:
     checkpointer_kind: str = "memory"  # "memory" | "sqlite"
     db_path: str = "~/.lang-agent/checkpoints.sqlite"
     recursion_limit: int = 25
+    # graph 调用异常重试（瞬时异常白名单 + 指数退避）
+    retry_max_attempts: int = 3  # 总尝试次数（含首次）
+    retry_base_delay: float = 0.5  # 首次退避秒数
+    retry_backoff_factor: float = 2.0  # 指数退避因子
+    retryable_exceptions: Optional[tuple] = None  # None → 默认白名单（见 core/retry.py）
 
 
 async def build_checkpointer(config: AgentLoopConfig):
@@ -238,6 +246,36 @@ class AgentLoop:
             },
         )
 
+    def _should_retry(self, exc: Exception, attempt: int) -> bool:
+        """attempt（已执行次数）后判定是否重试：白名单内且未达上限。"""
+        return attempt < self._config.retry_max_attempts and is_retryable(
+            exc, self._config.retryable_exceptions
+        )
+
+    async def _wait_before_retry(self, exc: Exception, attempt: int) -> None:
+        delay = compute_delay(
+            attempt,
+            self._config.retry_base_delay,
+            self._config.retry_backoff_factor,
+        )
+        logging.getLogger(__name__).warning(
+            "graph 调用失败（第 %d 次尝试）：%s: %s；%.1f 秒后重试",
+            attempt,
+            type(exc).__name__,
+            exc,
+            delay,
+        )
+        await asyncio.sleep(delay)
+
+    async def _resume_input(self, config: RunnableConfig, initial: Any) -> Any:
+        """重试输入：checkpoint 有 pending 任务 → input=None 从 checkpoint 续跑
+        （失败的超步重执行，输入消息不会重复追加）；尚无 checkpoint（首步即
+        失败）→ 复用原输入。"""
+        state = await self._graph.aget_state(config)
+        if state.next or state.values:
+            return None
+        return initial
+
     async def invoke(
         self, query: str, *, thread_id: str, system: Optional[str] = None
     ) -> ConversationResult:
@@ -247,9 +285,19 @@ class AgentLoop:
         不含该 thread 的历史轮次。
         """
         await self._repair_checkpoint_state(thread_id)
-        state = await self._graph.ainvoke(
-            cast(AgentState, self._initial_state(query, system)), self._run_config(thread_id)
-        )
+        initial = cast(AgentState, self._initial_state(query, system))
+        config = self._run_config(thread_id)
+        attempt = 0
+        while True:
+            attempt += 1
+            graph_input = initial if attempt == 1 else await self._resume_input(config, initial)
+            try:
+                state = await self._graph.ainvoke(graph_input, config)
+                break
+            except Exception as exc:
+                if not self._should_retry(exc, attempt):
+                    raise
+                await self._wait_before_retry(exc, attempt)
         round_messages = messages_after_last_human(state["messages"])
         final_text = ""
         for message in reversed(round_messages):
@@ -275,31 +323,43 @@ class AgentLoop:
         final_text = ""
         try:
             await self._repair_checkpoint_state(thread_id)
-            async for mode, payload in self._graph.astream(
-                cast(AgentState, self._initial_state(query, system)),
-                self._run_config(thread_id),
-                stream_mode=["messages", "updates"],
-            ):
-                if mode == "messages" and isinstance(payload, tuple) and len(payload) == 2:
-                    chunk, metadata = payload
-                    if isinstance(chunk, BaseMessage) and isinstance(metadata, dict):
-                        event = classify_message_chunk(chunk, metadata)
-                        if event:
-                            yield event
-                elif mode == "updates" and isinstance(payload, dict):
-                    for node, delta in payload.items():
-                        if node == AGENT_NODE:
-                            for message in delta.get("messages", []):
-                                if (
-                                    isinstance(message, AIMessage)
-                                    and isinstance(message.content, str)
-                                    and message.content
-                                    and not message.tool_calls
-                                ):
-                                    final_text = message.content
-                        for event in classify_node_update(node, delta):
-                            yield event
-            state = await self._graph.aget_state(self._run_config(thread_id))
+            initial = cast(AgentState, self._initial_state(query, system))
+            config = self._run_config(thread_id)
+            attempt = 0
+            while True:
+                attempt += 1
+                graph_input = initial if attempt == 1 else await self._resume_input(config, initial)
+                try:
+                    async for mode, payload in self._graph.astream(
+                        graph_input,
+                        config,
+                        stream_mode=["messages", "updates"],
+                    ):
+                        if mode == "messages" and isinstance(payload, tuple) and len(payload) == 2:
+                            chunk, metadata = payload
+                            if isinstance(chunk, BaseMessage) and isinstance(metadata, dict):
+                                event = classify_message_chunk(chunk, metadata)
+                                if event:
+                                    yield event
+                        elif mode == "updates" and isinstance(payload, dict):
+                            for node, delta in payload.items():
+                                if node == AGENT_NODE:
+                                    for message in delta.get("messages", []):
+                                        if (
+                                            isinstance(message, AIMessage)
+                                            and isinstance(message.content, str)
+                                            and message.content
+                                            and not message.tool_calls
+                                        ):
+                                            final_text = message.content
+                                for event in classify_node_update(node, delta):
+                                    yield event
+                    break
+                except Exception as exc:
+                    if not self._should_retry(exc, attempt):
+                        raise
+                    await self._wait_before_retry(exc, attempt)
+            state = await self._graph.aget_state(config)
             # 只汇总本轮（最后一条 HumanMessage 起）的 tool_calls，不含历史轮次
             round_messages = messages_after_last_human(state.values.get("messages", []))
             tool_calls = collect_tool_calls(round_messages)
