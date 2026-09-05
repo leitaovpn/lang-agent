@@ -139,6 +139,33 @@ async def test_tool_calls_only_summarize_current_round():
     assert second.tool_calls == []
 
 
+async def test_repair_persists_to_checkpoint():
+    # 第一轮模型返回重复 id 的 tool_call，产生坏尾部；第二轮调用时入口修复
+    # 把坏段写回 checkpoint——之后拉取到的历史 id 唯一、ToolMessage 一一对应
+    calls = [
+        {"name": "calculator", "args": {"expression": "1+1"}, "id": "dup", "type": "tool_call"},
+        {"name": "calculator", "args": {"expression": "2+2"}, "id": "dup", "type": "tool_call"},
+    ]
+    loop, _ = make_loop(
+        [
+            AIMessage(content="", tool_calls=calls),
+            AIMessage(content="分别是 2 和 4"),
+            AIMessage(content="好的"),
+        ],
+        checkpointer=InMemorySaver(),
+    )
+    await loop.invoke("算两个", thread_id="t1")
+    await loop.invoke("谢谢", thread_id="t1")
+
+    state = await loop._graph.aget_state({"configurable": {"thread_id": "t1"}})
+    messages = state.values["messages"]
+    ai = [m for m in messages if isinstance(m, AIMessage) and m.tool_calls][0]
+    ids = [c["id"] for c in ai.tool_calls]
+    assert len(ids) == len(set(ids)) == 2
+    tool_ids = [m.tool_call_id for m in messages if isinstance(m, ToolMessage)]
+    assert sorted(tool_ids) == sorted(ids)
+
+
 async def test_result_messages_only_current_round():
     loop, _ = make_loop(
         [AIMessage(content="第一答"), AIMessage(content="第二答")],

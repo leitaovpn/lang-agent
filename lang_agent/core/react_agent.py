@@ -1,9 +1,13 @@
 """core 层：手搓 StateGraph 的完整 ReAct agent loop。
 
 拓扑：
-    START → agent（LLM + bind_tools，流式合并）→ tools_condition
+    START → agent（LLM + bind_tools，流式合并）
               ├─ 无 tool_calls → END
+              ├─ 只有 invalid_tool_calls（已附错误反馈）→ agent（重试）
               └─ 有 tool_calls → tools（ToolNode 执行真实工具）→ agent（回环）
+
+invoke/stream 入口先做 _repair_checkpoint_state：修复并写回 checkpoint 里的历史，
+避免下次拉取到错误消息；发给 LLM 的拷贝在 agent 节点内再过 repair_messages_for_llm。
 
 用 checkpointer 按 thread_id 记忆多轮对话；对外统一暴露 invoke / stream，
 屏蔽底层 agent（图结构、工具、LLM）差异。
@@ -24,6 +28,7 @@ from langchain_core.messages import (
     BaseMessage,
     BaseMessageChunk,
     HumanMessage,
+    RemoveMessage,
     SystemMessage,
     ToolMessage,
 )
@@ -43,7 +48,11 @@ from lang_agent.core.events import (
     collect_tool_calls,
     messages_after_last_human,
 )
-from lang_agent.core.repair import INVALID_ID_PREFIX, repair_messages_for_llm
+from lang_agent.core.repair import (
+    INVALID_ID_PREFIX,
+    repair_messages_for_llm,
+    repair_state_for_checkpoint,
+)
 from lang_agent.core.tool_registry import instantiate_tools
 
 AGENT_NODE = "agent"
@@ -162,13 +171,13 @@ class AgentLoop:
             merged = cast(AIMessageChunk, chunks[0])
             for chunk in chunks[1:]:
                 merged = merged + cast(AIMessageChunk, chunk)
-            result: list[BaseMessage] = [merged]  # type: ignore    
-            if not merged.tool_calls:  # type: ignore    
+            result: list[BaseMessage] = [merged]  # type: ignore
+            if not merged.tool_calls:  # type: ignore
                 # 无合法调用：为解析失败的调用附错误反馈 ToolMessage，驱动循环重试。
                 # id 与 repair 层的确定性 id 一致（invalid_<消息下标>_<条内序号>），
                 # 避免下一轮修复时重复合成。
                 base_index = len(state["messages"])
-                for k, invalid in enumerate(merged.invalid_tool_calls or []):  # type: ignore    
+                for k, invalid in enumerate(merged.invalid_tool_calls or []):  # type: ignore
                     result.append(
                         ToolMessage(
                             content="工具调用格式错误: %s"
@@ -203,6 +212,37 @@ class AgentLoop:
             initial["system"] = system
         return initial
 
+    async def _repair_checkpoint_state(self, thread_id: str) -> None:
+        """invoke/stream 之前的入口修复：修复本地记忆（checkpoint）里的历史。
+
+        上一轮产生的坏段（重复 id、缺失 ToolMessage 等）在 checkpoint 里按原样
+        存储；本次调用开始前先修复并写回，避免下次 checkpoint 拉取到错误消息。
+
+        写回方式：add_messages reducer 对同 id 消息原位替换、新消息一律追加到
+        末尾——新合成的错误 ToolMessage 会跑到最后，破坏顺序。因此先用
+        RemoveMessage 全删再按修复后的顺序加回，精确重建消息列表
+        （此时新 HumanMessage 尚未入 state，顺序天然是 [AI, ToolMessage, ...]）。
+        """
+        config = self._run_config(thread_id)
+        state = await self._graph.aget_state(config)
+        current: list[BaseMessage] = (state.values or {}).get("messages", [])
+        if not current:
+            return
+        repaired = repair_state_for_checkpoint(list(current))
+        if repaired == current:
+            return
+        await self._graph.aupdate_state(
+            config,
+            {
+                "messages": [
+                    RemoveMessage(id=message.id)
+                    for message in current
+                    if message.id is not None
+                ]
+                + repaired
+            },
+        )
+
     async def invoke(
         self, query: str, *, thread_id: str, system: Optional[str] = None
     ) -> ConversationResult:
@@ -211,6 +251,7 @@ class AgentLoop:
         messages 与 tool_calls 都只含本轮（最后一条 HumanMessage 起）产生的内容，
         不含该 thread 的历史轮次。
         """
+        await self._repair_checkpoint_state(thread_id)
         state = await self._graph.ainvoke(
             cast(AgentState, self._initial_state(query, system)), self._run_config(thread_id)
         )
@@ -238,6 +279,7 @@ class AgentLoop:
         """
         final_text = ""
         try:
+            await self._repair_checkpoint_state(thread_id)
             async for mode, payload in self._graph.astream(
                 cast(AgentState, self._initial_state(query, system)),
                 self._run_config(thread_id),
@@ -264,9 +306,8 @@ class AgentLoop:
                             yield event
             state = await self._graph.aget_state(self._run_config(thread_id))
             # 只汇总本轮（最后一条 HumanMessage 起）的 tool_calls，不含历史轮次
-            tool_calls = collect_tool_calls(
-                messages_after_last_human(state.values.get("messages", []))
-            )
+            round_messages = messages_after_last_human(state.values.get("messages", []))
+            tool_calls = collect_tool_calls(round_messages)
             yield AgentEvent(
                 EVENT_DONE,
                 {
