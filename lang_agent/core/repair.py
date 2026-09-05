@@ -1,24 +1,20 @@
-"""发给 LLM 的历史修复：保证 tool_call 不变式（只修尾部）。
+"""checkpoint 里的历史修复：保证 tool_call 不变式。
 
 LLM 对消息历史的硬性要求（本项目必须满足）：
 1. AIMessage 若含 tool_calls，其后必须为每条 tool_call 配一条对应的 ToolMessage；
-2. tool_call_id 不重合——去重范围只限「两个 AIMessage 之间」（即最后一条
-   AIMessage 起的尾部内部），之前的 tool_call_id 不参与处理。
+2. tool_call_id 不重合——去重范围只限「两个 AIMessage 之间」，之前的
+   tool_call_id 不参与处理。
 
-为什么只修尾部：历史只由本循环追加，且每次发给 LLM 的历史都已修复——
-LLM 能回复新的 AIMessage，就证明该 AIMessage 之前的结构必然正确（归纳不变式）。
-可能违反不变式的只有最后一条 AIMessage 起的尾部：它的 tool_calls 是模型新产出的
-（可能解析失败、id 重复/缺失），其后的 ToolMessage 也可能缺失/重复。
+使用位置：invoke/stream 入口（_repair_checkpoint_state）——上一轮产生的坏段
+（重复 id、缺失 ToolMessage 等）在 checkpoint 里按原样存储，本次调用开始前
+修复并写回，避免下次 checkpoint 拉取到错误消息。写回用 RemoveMessage 全删
+再加回（add_messages reducer 会把新消息追加到末尾，直接返回修复列表会打乱顺序）。
 
-两处使用：
-1. invoke/stream 入口（_repair_checkpoint_state）：用 repair_state_for_checkpoint
-   修复 checkpoint 里存储的历史并写回（RemoveMessage 全删再加回，精确重建顺序），
-   下次调用无需重复修复；
-2. agent 节点内 repair_messages_for_llm：作用于发给 LLM 的拷贝（本轮循环中途
-   产生的坏尾部也需要修）。
+修复范围：最后一条**带 tool_calls/invalid_tool_calls** 的 AIMessage 起的段——
+坏段可能被本轮末尾的纯文本 AIMessage 推到「最后一条 AIMessage」之前。
 
 修复策略：
-- 尾部 tool_call_id 缺失/尾部内重复 → 改名去重（前缀 id 不参与）；
+- 段内 tool_call_id 缺失/重复 → 改名去重（前缀 id 不参与）；
 - 缺失的 ToolMessage → 合成「工具调用未返回结果」错误消息补齐；
 - 重复/孤儿 ToolMessage → 丢弃；
 - invalid_tool_calls（解析失败的调用）→ 合成「格式错误」反馈 ToolMessage，
@@ -39,13 +35,6 @@ def _unique_id(used: set, base: str) -> str:
         k += 1
     used.add(call_id)
     return call_id
-
-
-def _last_aimessage_index(messages: list[BaseMessage]) -> int:
-    for idx in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[idx], AIMessage):
-            return idx
-    return -1
 
 
 def _last_calling_aimessage_index(messages: list[BaseMessage]) -> int:
@@ -130,25 +119,12 @@ def _repair_from(messages: list[BaseMessage], start_ai: int) -> list[BaseMessage
     return repaired
 
 
-def repair_messages_for_llm(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """发给 LLM 的拷贝修复：只修最后一条 AIMessage 起的尾部（原列表不被修改）。"""
-    if not messages:
-        return []
-    last_ai = _last_aimessage_index(messages)
-    if last_ai < 0:
-        # 没有 AIMessage（如首轮只有用户消息）：无 tool 结构可修，
-        # 只丢弃孤儿 ToolMessage
-        return [m for m in messages if not isinstance(m, ToolMessage)]
-    return _repair_from(messages, last_ai)
-
-
 def repair_state_for_checkpoint(messages: list[BaseMessage]) -> list[BaseMessage]:
     """checkpoint 持久化修复：从最后一条带 tool_calls/invalid_tool_calls 的
     AIMessage 起修复（原列表不被修改）。
 
-    与 repair_messages_for_llm 的范围不同：坏段可能被本轮最终的纯文本
-    AIMessage 推到「最后一条 AIMessage」之前，因此持久化修复要越过它，
-    修到最后一个「调用工具」的段。
+    坏段可能被本轮最终的纯文本 AIMessage 推到「最后一条 AIMessage」之前，
+    因此修复要越过它，修到最后一个「调用工具」的段。
     """
     start_ai = _last_calling_aimessage_index(messages)
     if start_ai < 0:

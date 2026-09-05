@@ -7,7 +7,7 @@
               └─ 有 tool_calls → tools（ToolNode 执行真实工具）→ agent（回环）
 
 invoke/stream 入口先做 _repair_checkpoint_state：修复并写回 checkpoint 里的历史，
-避免下次拉取到错误消息；发给 LLM 的拷贝在 agent 节点内再过 repair_messages_for_llm。
+避免下次拉取到错误消息。
 
 用 checkpointer 按 thread_id 记忆多轮对话；对外统一暴露 invoke / stream，
 屏蔽底层 agent（图结构、工具、LLM）差异。
@@ -48,11 +48,7 @@ from lang_agent.core.events import (
     collect_tool_calls,
     messages_after_last_human,
 )
-from lang_agent.core.repair import (
-    INVALID_ID_PREFIX,
-    repair_messages_for_llm,
-    repair_state_for_checkpoint,
-)
+from lang_agent.core.repair import INVALID_ID_PREFIX, repair_state_for_checkpoint
 from lang_agent.core.tool_registry import instantiate_tools
 
 AGENT_NODE = "agent"
@@ -158,9 +154,8 @@ class AgentLoop:
             # agent 节点：流式调用 LLM 并合并 chunk，保证 token 级事件可被捕获。
             # 必须把 config 传给 astream：否则 bind_tools 的 RunnableBinding 内层
             # 模型收不到回调，token 级流式事件会丢失（langgraph 0.6 行为）。
-            # 发给 LLM 的历史先过修复层：保证每条 tool_call 都有对应 ToolMessage、
-            # tool_call_id 不重复（LLM 接口的硬性要求）。
-            messages: list[BaseMessage] = repair_messages_for_llm(list(state["messages"]))
+            # 历史在 invoke/stream 入口已修复并写回 checkpoint，这里原样使用。
+            messages: list[BaseMessage] = list(state["messages"])
             if state.get("system"):
                 messages = [SystemMessage(content=state["system"])] + messages
             chunks: list[BaseMessageChunk] = []

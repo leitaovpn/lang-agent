@@ -210,7 +210,9 @@ async def test_loop_retries_on_invalid_tool_calls():
     assert any(isinstance(m, ToolMessage) and "格式错误" in m.content for m in seen)
 
 
-async def test_loop_handles_duplicate_tool_call_ids():
+async def test_loop_completes_with_duplicate_tool_call_ids():
+    # 模型返回重复 id 的 tool_call：工具照常执行、循环照常完成；
+    # 历史修复由下次调用的入口 checkpoint 修复兜底
     calls = [
         {"name": "calculator", "args": {"expression": "1+1"}, "id": "dup", "type": "tool_call"},
         {"name": "calculator", "args": {"expression": "2+2"}, "id": "dup", "type": "tool_call"},
@@ -218,13 +220,12 @@ async def test_loop_handles_duplicate_tool_call_ids():
     loop, llm = make_loop([AIMessage(content="", tool_calls=calls), AIMessage(content="分别是 2 和 4")])
     result = await loop.invoke("算两个", thread_id="t1")
     assert result.final_text == "分别是 2 和 4"
-    # 第二轮 LLM 看到的历史满足不变式：tool_call_id 与 ToolMessage 一一对应且不重复
+    tool_contents = sorted(m.content for m in result.messages if isinstance(m, ToolMessage))
+    assert tool_contents == ["2", "4"]
+    # 不做 LLM 拷贝修复：第二轮模型看到的历史保持原样（重复 id 原样传入）
     seen = llm.seen_messages[1]
     ai = [m for m in seen if isinstance(m, AIMessage) and m.tool_calls][0]
-    ids = [c["id"] for c in ai.tool_calls]
-    assert len(ids) == len(set(ids)) == 2
-    tool_ids = [m.tool_call_id for m in seen if isinstance(m, ToolMessage)]
-    assert sorted(tool_ids) == sorted(ids)
+    assert [c["id"] for c in ai.tool_calls] == ["dup", "dup"]
 
 
 async def test_build_checkpointer_creates_missing_parent_dir(tmp_path):
