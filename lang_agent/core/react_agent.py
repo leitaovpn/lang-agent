@@ -40,7 +40,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, ConfigDict
-
+from langgraph.runtime import Runtime
 from lang_agent.core.events import (
     EVENT_DONE,
     EVENT_ERROR,
@@ -170,14 +170,14 @@ class AgentLoop:
 
     def _build_graph(self):
         async def agent_node(
-            state: AgentState, config: RunnableConfig, runtime
+            state: AgentState, config: RunnableConfig, runtime: Runtime
         ) -> dict[str, list[BaseMessage]]:
             # agent 节点：流式调用 LLM 并合并 chunk，保证 token 级事件可被捕获。
             # 必须把 config 传给 astream：否则 bind_tools 的 RunnableBinding 内层
             # 模型收不到回调，token 级流式事件会丢失（langgraph 0.6 行为）。
             # LLM 与工具集从 runtime.context 取（每次 run 注入，见 AgentContext）。
             # 历史在 invoke/stream 入口已修复并写回 checkpoint，这里原样使用。
-            context = runtime.context
+            context = cast(AgentContext, runtime.context)
             model = context.llm.bind_tools(context.tools)
             messages: list[BaseMessage] = list(state["messages"])
             if state.get("system"):
@@ -201,18 +201,19 @@ class AgentLoop:
                         ToolMessage(
                             content="工具调用格式错误: %s"
                             % (invalid.get("error") or "参数解析失败"),
-                            tool_call_id=f"{INVALID_ID_PREFIX}{base_index}_{k}",
+                            tool_call_id=invalid.get("id") or f"{INVALID_ID_PREFIX}{base_index}_{k}",
                             name=invalid.get("name") or "unknown_tool",
                         )
                     )
             return {"messages": result}
 
         async def tools_node(
-            state: AgentState, config: RunnableConfig, runtime
+            state: AgentState, config: RunnableConfig, runtime: Runtime
         ) -> dict[str, list[BaseMessage]]:
             # 工具节点：按每次 run 的 context 工具集构建 ToolNode 并执行
             # （ToolNode 是普通 Runnable，ainvoke 返回 {"messages": [...]} 更新）。
-            tool_node = ToolNode(runtime.context.tools)
+            context = cast(AgentContext, runtime.context)
+            tool_node = ToolNode(context.tools)
             return await tool_node.ainvoke(state, config)
 
         graph = StateGraph(AgentState, context_schema=AgentContext)
@@ -396,7 +397,8 @@ class AgentLoop:
                                             isinstance(message, AIMessage)
                                             and isinstance(message.content, str)
                                             and message.content
-                                            and not message.tool_calls
+                                            and not message.tool_calls 
+                                            and not message.invalid_tool_calls
                                         ):
                                             final_text = message.content
                                 for event in classify_node_update(node, delta):
