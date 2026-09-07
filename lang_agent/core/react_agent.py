@@ -51,6 +51,12 @@ from lang_agent.core.events import (
     collect_tool_calls,
     messages_after_last_human,
 )
+from lang_agent.core.compress import (
+    estimate_tokens,
+    find_round_start,
+    render_messages_for_summary,
+    truncate_tool_outputs,
+)
 from lang_agent.core.repair import INVALID_ID_PREFIX, repair_state_for_checkpoint
 from lang_agent.core.retry import compute_delay, is_retryable
 from lang_agent.core.tool_registry import instantiate_tools
@@ -65,6 +71,7 @@ class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     system: str
     raw_input: str
+    summary: str  # 早期对话摘要（context 压缩写回；发送时作为 SystemMessage 前缀）
 
 
 def should_continue(state: AgentState) -> str:
@@ -95,6 +102,7 @@ class AgentContext(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     llm: BaseChatModel
     tools: list[BaseTool]
+    summarizer_llm: Optional[BaseChatModel] = None  # context 压缩的摘要模型，缺省复用 llm
 
 
 @dataclass
@@ -107,6 +115,11 @@ class AgentLoopConfig:
     retry_base_delay: float = 0.5  # 首次退避秒数
     retry_backoff_factor: float = 2.0  # 指数退避因子
     retryable_exceptions: Optional[tuple] = None  # None → 默认白名单（见 core/retry.py）
+    # context 压缩（摘要 + 保留窗口 + 工具输出截断，见 core/compress.py）
+    compress_enabled: bool = True
+    compress_token_threshold: int = 8000  # 估算 token 超此阈值触发压缩
+    compress_keep_last: int = 8  # 保留最近 N 条完整消息
+    compress_tool_output_max_chars: int = 2000  # 发送视图工具输出截断上限
 
 
 async def build_checkpointer(config: AgentLoopConfig):
@@ -179,9 +192,16 @@ class AgentLoop:
             # 历史在 invoke/stream 入口已修复并写回 checkpoint，这里原样使用。
             context = cast(AgentContext, runtime.context)
             model = context.llm.bind_tools(context.tools)
+            # 发送视图：system 提示 + 摘要前缀 + 截断后的历史（截断不写回 checkpoint）
             messages: list[BaseMessage] = list(state["messages"])
+            prefix: list[BaseMessage] = []
             if state.get("system"):
-                messages = [SystemMessage(content=state["system"])] + messages
+                prefix.append(SystemMessage(content=state["system"]))
+            if state.get("summary"):
+                prefix.append(SystemMessage(content="早期对话摘要:\n" + state["summary"]))
+            messages = truncate_tool_outputs(
+                prefix + messages, self._config.compress_tool_output_max_chars
+            )
             chunks: list[BaseMessageChunk] = []
             async for chunk in model.astream(messages, config=config):
                 chunks.append(cast(BaseMessageChunk, chunk))
@@ -272,6 +292,48 @@ class AgentLoop:
             },
         )
 
+    async def _compress_checkpoint_state(self, thread_id: str, ctx: AgentContext) -> None:
+        """invoke/stream 之前的入口压缩（在 _repair_checkpoint_state 之后执行）。
+
+        token 估算超阈值时：把保留窗口（compress_keep_last）之前的完整轮次交给
+        摘要模型总结，摘要写回 checkpoint 的 summary 字段、旧消息用 RemoveMessage
+        删除——切点由 find_round_start 保证落在轮起点，tool_call 段永不拆散，
+        压缩后历史仍满足 repair 不变式。未超阈值时零成本返回。
+        """
+        if not self._config.compress_enabled:
+            return
+        config = self._run_config(thread_id)
+        state = await self._graph.aget_state(config)
+        current: list[BaseMessage] = list((state.values or {}).get("messages", []))
+        if not current:
+            return
+        tokens = estimate_tokens(current, ctx.llm)
+        if tokens <= self._config.compress_token_threshold:
+            return
+        cut = find_round_start(current, len(current) - self._config.compress_keep_last)
+        if cut <= 0:
+            return  # 保留窗口已覆盖全部历史，无可压缩
+        old = current[:cut]
+        rendered = render_messages_for_summary(old)
+        prompt = (
+            "请把以下对话历史总结成简短摘要，保留：用户目标与偏好、关键结论与事实、"
+            "工具调用的重要结果。只输出摘要本身：\n\n" + rendered
+        )
+        summarizer = ctx.summarizer_llm or ctx.llm
+        response = await summarizer.ainvoke([HumanMessage(content=prompt)])
+        segment = (
+            response.content if isinstance(response.content, str) else str(response.content)
+        )
+        old_summary = (state.values or {}).get("summary") or ""
+        new_summary = (old_summary + "\n" if old_summary else "") + segment
+        await self._graph.aupdate_state(
+            config,
+            {
+                "summary": new_summary,
+                "messages": [RemoveMessage(id=m.id) for m in old if m.id is not None],
+            },
+        )
+
     def _should_retry(self, exc: Exception, attempt: int) -> bool:
         """attempt（已执行次数）后判定是否重试：白名单内且未达上限。"""
         return attempt < self._config.retry_max_attempts and is_retryable(
@@ -321,6 +383,7 @@ class AgentLoop:
         """
         ctx = context or self._context
         await self._repair_checkpoint_state(thread_id)
+        await self._compress_checkpoint_state(thread_id, ctx)
         initial = cast(AgentState, self._initial_state(query, system))
         config = self._run_config(thread_id)
         attempt = 0

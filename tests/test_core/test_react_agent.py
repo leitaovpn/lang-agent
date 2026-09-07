@@ -398,6 +398,129 @@ async def test_stream_uses_custom_context():
     assert not default_llm.seen_messages
 
 
+# ---- context 压缩：摘要 + 保留窗口 + 工具输出截断 ----
+
+
+async def test_compress_writes_back_summary_and_removes_old_rounds():
+    summarizer = FakeChatModel(responses=[AIMessage(content="早期摘要内容")])
+    llm = FakeChatModel(responses=[AIMessage(content="答1"), AIMessage(content="答2"), AIMessage(content="答3"), AIMessage(content="答4")])
+    loop = AgentLoop(
+        llm=llm,
+        config=AgentLoopConfig(compress_token_threshold=1, compress_keep_last=4),
+        checkpointer=InMemorySaver(),
+    )
+    ctx = AgentContext(llm=llm, tools=instantiate_tools(), summarizer_llm=summarizer)
+    for i, q in enumerate(["问1", "问2", "问3", "问4"], start=1):
+        await loop.invoke(q, thread_id="t1", context=ctx)
+        # 第 4 轮入口才发生压缩（入口时历史 6 条 > keep_last 4）
+
+    state = await loop._graph.aget_state({"configurable": {"thread_id": "t1"}})
+    values = state.values
+    assert values.get("summary") == "早期摘要内容"
+    contents = [m.content for m in values["messages"] if isinstance(m, (HumanMessage, AIMessage))]
+    assert contents == ["问2", "答2", "问3", "答3", "问4", "答4"]
+    # 第 4 轮 LLM 收到摘要前缀
+    seen = llm.seen_messages[3]
+    assert any(isinstance(m, SystemMessage) and "早期对话摘要" in m.content and "早期摘要内容" in m.content for m in seen)
+
+
+async def test_compress_falls_back_to_dialogue_llm_as_summarizer():
+    # summarizer_llm 缺省时复用对话 llm：脚本需含摘要消费的条目
+    llm = FakeChatModel(
+        responses=[
+            AIMessage(content="答1"),
+            AIMessage(content="答2"),
+            AIMessage(content="答3"),
+            AIMessage(content="对话llm做的摘要"),
+            AIMessage(content="答4"),
+        ]
+    )
+    loop = AgentLoop(
+        llm=llm,
+        config=AgentLoopConfig(compress_token_threshold=1, compress_keep_last=4),
+        checkpointer=InMemorySaver(),
+    )
+    for q in ["问1", "问2", "问3", "问4"]:
+        await loop.invoke(q, thread_id="t1")
+    state = await loop._graph.aget_state({"configurable": {"thread_id": "t1"}})
+    assert state.values.get("summary") == "对话llm做的摘要"
+
+
+async def test_compress_keeps_repair_invariant():
+    summarizer = FakeChatModel(responses=[AIMessage(content="摘要")])
+    llm = FakeChatModel(responses=[AIMessage(content="答1"), AIMessage(content="答2"), AIMessage(content="答3"), AIMessage(content="答4")])
+    loop = AgentLoop(
+        llm=llm,
+        config=AgentLoopConfig(compress_token_threshold=1, compress_keep_last=4),
+        checkpointer=InMemorySaver(),
+    )
+    ctx = AgentContext(llm=llm, tools=instantiate_tools(), summarizer_llm=summarizer)
+    for q in ["问1", "问2", "问3", "问4"]:
+        await loop.invoke(q, thread_id="t1", context=ctx)
+
+    from lang_agent.core.repair import repair_state_for_checkpoint
+
+    state = await loop._graph.aget_state({"configurable": {"thread_id": "t1"}})
+    messages = list(state.values["messages"])
+    assert repair_state_for_checkpoint(messages) == messages  # 压缩后历史仍满足不变式
+
+
+async def test_compress_skipped_below_threshold():
+    llm = FakeChatModel(responses=[AIMessage(content="答1"), AIMessage(content="答2")])
+    loop = AgentLoop(
+        llm=llm,
+        config=AgentLoopConfig(compress_token_threshold=10**9),
+        checkpointer=InMemorySaver(),
+    )
+    await loop.invoke("问1", thread_id="t1")
+    await loop.invoke("问2", thread_id="t1")
+    state = await loop._graph.aget_state({"configurable": {"thread_id": "t1"}})
+    assert (state.values.get("summary") or "") == ""
+    contents = [m.content for m in state.values["messages"] if isinstance(m, (HumanMessage, AIMessage))]
+    assert contents == ["问1", "答1", "问2", "答2"]
+
+
+async def test_compress_uses_dedicated_summarizer():
+    summarizer = FakeChatModel(responses=[AIMessage(content="独立摘要")])
+    llm = FakeChatModel(responses=[AIMessage(content="答1"), AIMessage(content="答2"), AIMessage(content="答3"), AIMessage(content="答4")])
+    loop = AgentLoop(
+        llm=llm,
+        config=AgentLoopConfig(compress_token_threshold=1, compress_keep_last=4),
+        checkpointer=InMemorySaver(),
+    )
+    for q in ["问1", "问2", "问3", "问4"]:
+        await loop.invoke(q, thread_id="t1", context=AgentContext(llm=llm, tools=instantiate_tools(), summarizer_llm=summarizer))
+    state = await loop._graph.aget_state({"configurable": {"thread_id": "t1"}})
+    assert state.values.get("summary") == "独立摘要"
+    assert summarizer.seen_messages  # 独立摘要模型承担了摘要
+    assert len(llm.seen_messages) == 4  # 对话 llm 未被摘要调用消耗
+
+
+async def test_tool_output_truncation_in_send_view_only():
+    long_text = "长" * 300
+    llm = FakeChatModel(
+        responses=[
+            AIMessage(content="", tool_calls=[{"name": "string_reverse", "args": {"text": long_text}, "id": "c1", "type": "tool_call"}]),
+            AIMessage(content="已反转"),
+        ]
+    )
+    loop = AgentLoop(
+        llm=llm,
+        config=AgentLoopConfig(compress_tool_output_max_chars=10),
+        checkpointer=InMemorySaver(),
+    )
+    result = await loop.invoke("反转", thread_id="t1")
+    assert result.final_text == "已反转"
+    # 发送视图：LLM 第二轮看到的工具输出被截断
+    seen = llm.seen_messages[1]
+    seen_tool = [m for m in seen if isinstance(m, ToolMessage)][0]
+    assert "已截断" in seen_tool.content
+    # checkpoint：完整内容保留
+    state = await loop._graph.aget_state({"configurable": {"thread_id": "t1"}})
+    state_tool = [m for m in state.values["messages"] if isinstance(m, ToolMessage)][0]
+    assert len(state_tool.content) == len(long_text)
+
+
 # ---- ToolNode 异常语义锁定：工具异常/未知工具 → 错误 ToolMessage 投喂 LLM，不抛出 ----
 
 
