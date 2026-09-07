@@ -3,8 +3,9 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from lang_agent.core.react_agent import AgentLoop, AgentLoopConfig, build_checkpointer
+from lang_agent.core.react_agent import AgentContext, AgentLoop, AgentLoopConfig, build_checkpointer
 from lang_agent.core.retry import RetryableError
+from lang_agent.core.tool_registry import instantiate_tools
 from tests.conftest import FakeChatModel, FlakyChatModel
 
 TOOL_CALL = {
@@ -349,6 +350,52 @@ async def test_stream_ends_with_error_event_after_exhaustion():
     events = [event async for event in loop.stream("问", thread_id="t1")]
     assert events[-1].type == "error"
     assert "持续超时" in events[-1].data["message"]
+
+
+# ---- LLM/tools 经 langgraph context 注入：每次 run 可替换 ----
+
+
+async def test_invoke_uses_custom_context_llm_and_tools():
+    default_llm = FakeChatModel(responses=[AIMessage(content="不应被调用")])
+    loop = AgentLoop(llm=default_llm, checkpointer=InMemorySaver())
+
+    custom_llm = FakeChatModel(responses=[AIMessage(content="自定义上下文回答")])
+    custom_ctx = AgentContext(llm=custom_llm, tools=instantiate_tools())
+    result = await loop.invoke("你好", thread_id="t1", context=custom_ctx)
+    assert result.final_text == "自定义上下文回答"
+    assert custom_llm.seen_messages and not default_llm.seen_messages
+
+
+async def test_custom_context_restricts_tools():
+    # context.tools 只给 calculator：LLM 调 string_len 应得到 not a valid tool 错误反馈
+    calls = [
+        {"name": "string_len", "args": {"text": "abc"}, "id": "c1", "type": "tool_call"}
+    ]
+    llm = FakeChatModel(responses=[AIMessage(content="", tool_calls=calls), AIMessage(content="工具不可用，我直接回答")])
+    loop = AgentLoop(llm=llm, checkpointer=InMemorySaver())
+
+    calculator_only = [t for t in instantiate_tools() if t.name == "calculator"]
+    result = await loop.invoke("算 abc 长度", thread_id="t1", context=AgentContext(llm=llm, tools=calculator_only))
+    assert result.final_text == "工具不可用，我直接回答"
+    tool_msgs = [m for m in result.messages if isinstance(m, ToolMessage)]
+    assert len(tool_msgs) == 1
+    assert "not a valid tool" in tool_msgs[0].content
+
+
+async def test_stream_uses_custom_context():
+    default_llm = FakeChatModel(responses=[AIMessage(content="不应被调用")])
+    loop = AgentLoop(llm=default_llm, checkpointer=InMemorySaver())
+
+    custom_llm = FakeChatModel(responses=[AIMessage(content="流式自定义回答")])
+    events = [
+        event
+        async for event in loop.stream(
+            "你好", thread_id="t1", context=AgentContext(llm=custom_llm, tools=instantiate_tools())
+        )
+    ]
+    assert events[-1].type == "done"
+    assert events[-1].data["final_text"] == "流式自定义回答"
+    assert not default_llm.seen_messages
 
 
 # ---- ToolNode 异常语义锁定：工具异常/未知工具 → 错误 ToolMessage 投喂 LLM，不抛出 ----

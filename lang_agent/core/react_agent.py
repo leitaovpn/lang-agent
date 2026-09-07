@@ -39,6 +39,7 @@ from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from pydantic import BaseModel, ConfigDict
 
 from lang_agent.core.events import (
     EVENT_DONE,
@@ -81,6 +82,19 @@ def should_continue(state: AgentState) -> str:
                 return AGENT_NODE
             return END
     return END
+
+
+class AgentContext(BaseModel):
+    """每次 run 的静态上下文：LLM 与工具集。
+
+    langgraph 0.6 的 context 特性：不写入 checkpoint、run 内只读、共享给所有节点。
+    节点通过注入的 runtime 对象访问（runtime.context）——0.6.11 不支持以
+    `context` 参数名直接注入节点函数。
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    llm: BaseChatModel
+    tools: list[BaseTool]
 
 
 @dataclass
@@ -146,6 +160,7 @@ class AgentLoop:
                 "请先 await build_checkpointer(config) 再注入 checkpointer 参数"
             )
         self._tools = self._build_tools(tools)
+        self._context = AgentContext(llm=self._llm, tools=self._tools)
         self._graph = self._build_graph()
 
     def _build_tools(self, tools:  Optional[list[BaseTool]] = None) -> list[BaseTool]:
@@ -154,15 +169,16 @@ class AgentLoop:
         return default_tools + (tools or [])
 
     def _build_graph(self):
-        model = self._llm.bind_tools(self._tools)
-
         async def agent_node(
-            state: AgentState, config: RunnableConfig
+            state: AgentState, config: RunnableConfig, runtime
         ) -> dict[str, list[BaseMessage]]:
             # agent 节点：流式调用 LLM 并合并 chunk，保证 token 级事件可被捕获。
             # 必须把 config 传给 astream：否则 bind_tools 的 RunnableBinding 内层
             # 模型收不到回调，token 级流式事件会丢失（langgraph 0.6 行为）。
+            # LLM 与工具集从 runtime.context 取（每次 run 注入，见 AgentContext）。
             # 历史在 invoke/stream 入口已修复并写回 checkpoint，这里原样使用。
+            context = runtime.context
+            model = context.llm.bind_tools(context.tools)
             messages: list[BaseMessage] = list(state["messages"])
             if state.get("system"):
                 messages = [SystemMessage(content=state["system"])] + messages
@@ -191,9 +207,18 @@ class AgentLoop:
                     )
             return {"messages": result}
 
-        graph = StateGraph(AgentState)
-        graph.add_node(AGENT_NODE, agent_node)
-        graph.add_node(TOOLS_NODE, ToolNode(self._tools))
+        async def tools_node(
+            state: AgentState, config: RunnableConfig, runtime
+        ) -> dict[str, list[BaseMessage]]:
+            # 工具节点：按每次 run 的 context 工具集构建 ToolNode 并执行
+            # （ToolNode 是普通 Runnable，ainvoke 返回 {"messages": [...]} 更新）。
+            tool_node = ToolNode(runtime.context.tools)
+            return await tool_node.ainvoke(state, config)
+
+        graph = StateGraph(AgentState, context_schema=AgentContext)
+        # runtime 注入在 langgraph 类型定义之外（运行时已验证），类型检查忽略
+        graph.add_node(AGENT_NODE, agent_node)  # type: ignore
+        graph.add_node(TOOLS_NODE, tools_node)  # type: ignore
         graph.add_edge(START, AGENT_NODE)
         graph.add_conditional_edges(AGENT_NODE, should_continue)
         graph.add_edge(TOOLS_NODE, AGENT_NODE)
@@ -281,13 +306,19 @@ class AgentLoop:
         return initial
 
     async def invoke(
-        self, query: str, *, thread_id: str, system: Optional[str] = None
+        self,
+        query: str,
+        *,
+        thread_id: str,
+        system: Optional[str] = None,
+        context: Optional[AgentContext] = None,
     ) -> ConversationResult:
         """同步语义的一次调用：返回最终文本、本轮消息与工具调用汇总。
 
         messages 与 tool_calls 都只含本轮（最后一条 HumanMessage 起）产生的内容，
-        不含该 thread 的历史轮次。
+        不含该 thread 的历史轮次。context 可覆盖默认的 LLM/工具集（每次 run 注入）。
         """
+        ctx = context or self._context
         await self._repair_checkpoint_state(thread_id)
         initial = cast(AgentState, self._initial_state(query, system))
         config = self._run_config(thread_id)
@@ -298,7 +329,7 @@ class AgentLoop:
                 initial if attempt == 1 else await self._resume_input(thread_id, config, initial)
             )
             try:
-                state = await self._graph.ainvoke(graph_input, config)
+                state = await self._graph.ainvoke(graph_input, config, context=ctx)
                 break
             except Exception as exc:
                 if not self._should_retry(exc, attempt):
@@ -318,14 +349,21 @@ class AgentLoop:
         )
 
     async def stream(
-        self, query: str, *, thread_id: str, system: Optional[str] = None
+        self,
+        query: str,
+        *,
+        thread_id: str,
+        system: Optional[str] = None,
+        context: Optional[AgentContext] = None,
     ) -> AsyncIterator[AgentEvent]:
         """流式执行：依次产出 llm_token / tool_call / tool_result，最后 done 或 error。
 
         基于 graph.astream(stream_mode=["messages", "updates"])：
         - messages 通道给 token 级文本（只取 agent 节点的 chunk）
         - updates 通道给完整 AIMessage（tool_call 决策）与 ToolMessage（tool_result）
+        context 可覆盖默认的 LLM/工具集（每次 run 注入，重试续跑沿用同一份）。
         """
+        ctx = context or self._context
         final_text = ""
         try:
             await self._repair_checkpoint_state(thread_id)
@@ -335,12 +373,13 @@ class AgentLoop:
             while True:
                 attempt += 1
                 graph_input = (
-                initial if attempt == 1 else await self._resume_input(thread_id, config, initial)
-            )
+                    initial if attempt == 1 else await self._resume_input(thread_id, config, initial)
+                )
                 try:
                     async for mode, payload in self._graph.astream(
                         graph_input,
                         config,
+                        context=ctx,
                         stream_mode=["messages", "updates"],
                     ):
                         if mode == "messages" and isinstance(payload, tuple) and len(payload) == 2:

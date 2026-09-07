@@ -29,6 +29,7 @@ lang-agent：基于 langgraph 的 lang agent，分三层：
 ## 架构要点
 
 - **State**：`AgentState` TypedDict，`messages: Annotated[list[AnyMessage], add_messages]`（`AnyMessage` 来自 langchain_core.messages，`add_messages` 来自 langgraph.graph.message），外加只读元数据字段 `system`、`raw_input`
+- **LLM/tools 经 langgraph context 注入**：`AgentContext`（pydantic，`arbitrary_types_allowed=True`）承载 llm + tools，`StateGraph(AgentState, context_schema=AgentContext)` 声明（**不是** `compile()` 参数——0.6.11 实测报错）；invoke/stream 可传 `context=` 覆盖默认（每次 run 注入，重试续跑沿用同一份）。**节点不能以 `context` 参数名接收**（0.6.11 会报 missing argument），正确姿势是接收注入的 `runtime` 对象，用 `runtime.context` 访问；工具节点按 `runtime.context.tools` 动态构建 `ToolNode(...).ainvoke(state, config)`
 - **拓扑**：`START → agent（bind_tools + 流式合并 chunk）→ should_continue → tools（ToolNode）/ END / agent（重试）`，`tools → agent` 回环
 - **LLM 历史不变式**（`core/repair.py`）：checkpoint 里存储的历史必须满足「AIMessage 的每条 tool_call 后面都有对应 ToolMessage，tool_call_id 在**两个 AIMessage 之间**不重合」。invoke/stream 开始前 `_repair_checkpoint_state` 用 `repair_state_for_checkpoint` 修复并写回——范围是最后一条**带 tool_calls** 的 AIMessage 起（坏段可能被本轮末尾的纯文本 AIMessage 推到前缀）；写回用 RemoveMessage 全删再加回，精确重建顺序（add_messages reducer 会把新消息追加到末尾，直接返回修复列表会打乱顺序）。前缀 tool_call_id 完全不参与去重；段内缺结果合成错误 ToolMessage、重复/孤儿丢弃、重复 id 改名、invalid_tool_calls 合成错误反馈；`should_continue` 看到只有 invalid_tool_calls 的 AIMessage 会带反馈回 agent 重试
 - **流式**：`graph.astream(stream_mode=["messages", "updates"])` 双通道——messages 给 token 级文本（metadata 按 `langgraph_node` 过滤），updates 给完整 AIMessage（tool_call）与 ToolMessage（tool_result）；事件分类是 `core/events.py` 的纯函数
