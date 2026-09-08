@@ -133,7 +133,6 @@ async def build_checkpointer(config: AgentLoopConfig):
     """
     if config.checkpointer_kind == "sqlite":
         import aiosqlite
-
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
         if config.db_path != ":memory:":
