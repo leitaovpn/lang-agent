@@ -3,7 +3,12 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from lang_agent.core.react_agent import AgentContext, AgentLoop, AgentLoopConfig, build_checkpointer
+from lang_agent.core.react_agent import (
+    AgentContext,
+    AgentLoop,
+    AgentLoopConfig,
+    build_checkpointer,
+)
 from lang_agent.core.retry import RetryableError
 from lang_agent.core.tool_registry import instantiate_tools
 from tests.conftest import FakeChatModel, FlakyChatModel
@@ -172,7 +177,7 @@ async def test_repair_persists_to_checkpoint():
 
     state = await loop._graph.aget_state({"configurable": {"thread_id": "t1"}})
     messages = state.values["messages"]
-    ai = [m for m in messages if isinstance(m, AIMessage) and m.tool_calls][0]
+    ai = next(m for m in messages if isinstance(m, AIMessage) and m.tool_calls)
     ids = [c["id"] for c in ai.tool_calls]
     assert len(ids) == len(set(ids)) == 2
     tool_ids = [m.tool_call_id for m in messages if isinstance(m, ToolMessage)]
@@ -237,7 +242,7 @@ async def test_loop_completes_with_duplicate_tool_call_ids():
     assert tool_contents == ["2", "4"]
     # 不做 LLM 拷贝修复：第二轮模型看到的历史保持原样（重复 id 原样传入）
     seen = llm.seen_messages[1]
-    ai = [m for m in seen if isinstance(m, AIMessage) and m.tool_calls][0]
+    ai = next(m for m in seen if isinstance(m, AIMessage) and m.tool_calls)
     assert [c["id"] for c in ai.tool_calls] == ["dup", "dup"]
 
 
@@ -322,7 +327,7 @@ async def test_retry_resume_repairs_mid_run_broken_messages():
     assert flaky.calls == 3
     # seen[0]：第 1 次调用（只看到用户消息）；seen[1]：续跑调用（看到修复后的历史）
     resumed = flaky.seen_messages[1]
-    ai_resumed = [m for m in resumed if isinstance(m, AIMessage) and m.tool_calls][0]
+    ai_resumed = next(m for m in resumed if isinstance(m, AIMessage) and m.tool_calls)
     ids = [c["id"] for c in ai_resumed.tool_calls]
     assert len(ids) == len(set(ids)) == 2
     tool_ids = [m.tool_call_id for m in resumed if isinstance(m, ToolMessage)]
@@ -344,7 +349,7 @@ async def test_stream_retry_resume_repairs_mid_run_broken_messages():
     assert events[-1].type == "done"
     assert events[-1].data["final_text"] == "答案是 X"
     resumed = flaky.seen_messages[1]
-    ai_resumed = [m for m in resumed if isinstance(m, AIMessage) and m.tool_calls][0]
+    ai_resumed = next(m for m in resumed if isinstance(m, AIMessage) and m.tool_calls)
     ids = [c["id"] for c in ai_resumed.tool_calls]
     assert len(ids) == len(set(ids)) == 2
     tool_ids = [m.tool_call_id for m in resumed if isinstance(m, ToolMessage)]
@@ -524,11 +529,11 @@ async def test_tool_output_truncation_in_send_view_only():
     assert result.final_text == "已反转"
     # 发送视图：LLM 第二轮看到的工具输出被截断
     seen = llm.seen_messages[1]
-    seen_tool = [m for m in seen if isinstance(m, ToolMessage)][0]
+    seen_tool = next(m for m in seen if isinstance(m, ToolMessage))
     assert "已截断" in seen_tool.content
     # checkpoint：完整内容保留
     state = await loop._graph.aget_state({"configurable": {"thread_id": "t1"}})
-    state_tool = [m for m in state.values["messages"] if isinstance(m, ToolMessage)][0]
+    state_tool = next(m for m in state.values["messages"] if isinstance(m, ToolMessage))
     assert len(state_tool.content) == len(long_text)
 
 

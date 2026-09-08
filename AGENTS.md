@@ -24,7 +24,14 @@ lang-agent：基于 langgraph 的 lang agent，分三层：
 .venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "..." --stream  # CLI 冒烟
 ```
 
-没有 lint/format/CI 配置。IDE 类型诊断与运行时同为 Python 3.13，可直接以诊断为准。
+没有 CI 配置；lint 与类型检查工具已锁进 dev 依赖：
+
+```bash
+.venv_3.13/bin/ruff check lang_agent/ tests/                                   # lint
+.venv_3.13/bin/mypy lang_agent tests --explicit-package-bases                  # 类型检查
+```
+
+IDE 类型诊断与运行时同为 Python 3.13，可直接以诊断为准。
 
 ## 架构要点
 

@@ -1,12 +1,13 @@
 """共享测试设施：可编程 FakeChatModel。"""
 import json
-from collections.abc import Iterator
-from typing import Any, override
+from collections.abc import Callable, Iterator, Sequence
+from typing import Any, cast, override
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.tools import BaseTool
 from pydantic import Field
 
 
@@ -30,7 +31,13 @@ class FakeChatModel(BaseChatModel):
         return "fake-chat"
 
     @override
-    def bind_tools(self, tools: list[Any], *, tool_choice: Any = None, **kwargs: Any):
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
+        *,
+        tool_choice: Any = None,
+        **kwargs: Any,
+    ):
         """记录被绑定的工具，并像真实模型一样返回 RunnableBinding（BaseChatModel.bind_tools 是抽象方法）。"""
         self.bound_tools.extend(tools)
         return self.bind(tools=list(tools))
@@ -56,7 +63,10 @@ class FakeChatModel(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        message = self._generate(messages, stop=stop, run_manager=run_manager, **kwargs).generations[0].message
+        message = cast(
+            AIMessage,
+            self._generate(messages, stop=stop, run_manager=run_manager, **kwargs).generations[0].message,
+        )
         if isinstance(message.content, str):
             for token in message.content:
                 yield ChatGenerationChunk(message=AIMessageChunk(content=token))

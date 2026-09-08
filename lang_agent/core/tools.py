@@ -1,10 +1,12 @@
 """内置无副作用演示工具。"""
 import ast
 import operator
+from collections.abc import Callable
+from typing import Any
 
 from pydantic import BaseModel, Field
 
-_BIN_OPS = {
+_BIN_OPS: dict[type[ast.operator], Callable[[Any, Any], Any]] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
@@ -13,7 +15,10 @@ _BIN_OPS = {
     ast.Mod: operator.mod,
     ast.Pow: operator.pow,
 }
-_UNARY_OPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+_UNARY_OPS: dict[type[ast.unaryop], Callable[[Any], Any]] = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
 
 
 def _safe_eval(node: ast.AST) -> int | float:

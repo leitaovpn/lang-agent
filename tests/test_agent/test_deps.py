@@ -17,7 +17,12 @@ def test_loop_config_kind():
 
 
 def test_loop_config_injects_openai_transient_exceptions():
-    from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+    from openai import (
+        APIConnectionError,
+        APITimeoutError,
+        InternalServerError,
+        RateLimitError,
+    )
 
     cfg = app_config.loop_config()
     injected = set(cfg.retryable_exceptions or ())

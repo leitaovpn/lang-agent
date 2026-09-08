@@ -6,7 +6,6 @@
   与其 ToolMessage 永不拆散，压缩后历史仍满足 repair 不变式；
 - 超长工具输出在发送视图截断（不写回 checkpoint，完整内容可追溯）。
 """
-from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 
@@ -16,7 +15,7 @@ def estimate_tokens(messages: list[BaseMessage], llm=None) -> int:
     if llm is not None:
         try:
             return llm.get_num_tokens_from_messages(messages)
-        except Exception:  # noqa: BLE001 兜底近似估算
+        except Exception:  # noqa: BLE001, S110 兜底近似估算
             pass
     return sum(len(m.content) // 4 + 1 for m in messages if isinstance(m.content, str))
 

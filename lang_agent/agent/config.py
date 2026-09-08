@@ -18,7 +18,12 @@ DEFAULT_PORT = int(os.getenv("LANG_AGENT_PORT", "8000"))
 
 def _retryable_exceptions() -> tuple[type[Exception], ...]:
     """agent 层重试白名单：openai SDK 的瞬时异常（core 层不依赖 ai，无法内置）。"""
-    from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+    from openai import (
+        APIConnectionError,
+        APITimeoutError,
+        InternalServerError,
+        RateLimitError,
+    )
 
     return (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError)
 
