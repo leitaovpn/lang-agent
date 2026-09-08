@@ -13,9 +13,9 @@
 ## 快速开始
 
 ```bash
-# Python 3.9+，创建 venv 并安装依赖
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+# Python 3.13+，创建 venv 并安装依赖
+python3 -m venv .venv_3.13
+.venv_3.13/bin/pip install -r requirements.txt
 
 # 配置 deepseek API key
 cp .env.example .env
@@ -25,21 +25,21 @@ cp .env.example .env
 启动服务：
 
 ```bash
-.venv/bin/python -m lang_agent.agent.cli serve            # 默认 127.0.0.1:8000
+.venv_3.13/bin/python -m lang_agent.agent.cli serve            # 默认 127.0.0.1:8000
 ```
 
 CLI 调用（纯 HTTP 客户端，走本地 API）：
 
 ```bash
 # 同步
-.venv/bin/python -m lang_agent.agent.cli chat --msg "你好"
+.venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "你好"
 
 # 流式（token 级打印，工具过程灰显）
-.venv/bin/python -m lang_agent.agent.cli chat --msg "计算 (3+5)*7" --stream
+.venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "计算 (3+5)*7" --stream
 
 # 多轮对话（thread_id 记忆历史）
-.venv/bin/python -m lang_agent.agent.cli chat --msg "计算 (3+5)*7" --stream --thread-id my-thread
-.venv/bin/python -m lang_agent.agent.cli chat --msg "再乘 2 是多少" --stream --thread-id my-thread
+.venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "计算 (3+5)*7" --stream --thread-id my-thread
+.venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "再乘 2 是多少" --stream --thread-id my-thread
 ```
 
 直接调 API：
@@ -178,11 +178,11 @@ register_tool(ToolSpec(name="weather", description="查询天气", fn=weather, a
 ## 测试
 
 ```bash
-.venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest        # 53 个测试，全部用 FakeChatModel 注入，不依赖真实 API key
+.venv_3.13/bin/pip install -r requirements-dev.txt
+.venv_3.13/bin/python -m pytest        # 101 个测试，全部用 FakeChatModel 注入，不依赖真实 API key
 ```
 
 ## 已知注意点
 
-- venv Python 3.9.6 + macOS LibreSSL：urllib3 v2 会打印 `NotOpenSSLWarning`，无害
-- langgraph 0.6.11 + langchain-core 0.3.86 的组合有几个坑（节点内 config 传递、TypedDict 注解、AsyncSqliteSaver 异步创建等），已在代码注释与 `tests/conftest.py` 中固化写法，改动 core/ai 层前建议先看现有实现
+- langgraph 1.2.11 + langchain-core 1.6.2 的组合有几个坑（节点内 config 传递、TypedDict 注解、AsyncSqliteSaver 异步创建、ToolNode handle_tool_errors、chunk 合并对 invalid_tool_calls 的误判等），已在代码注释与 `tests/conftest.py` 中固化写法，改动 core/ai 层前建议先看现有实现
+- langchain-community / langchain-experimental 已进入 sunset 维护，import 会打 DeprecationWarning，无害
