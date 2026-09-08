@@ -213,8 +213,8 @@ class AgentLoop:
             if not chunks:
                 return {"messages": []}
             merged = cast(AIMessageChunk, chunks[0])
-            for chunk in chunks[1:]:
-                merged = merged + cast(AIMessageChunk, chunk)
+            for other in chunks[1:]:
+                merged = merged + cast(AIMessageChunk, other)
             # langchain-core 1.x：chunk 合并（add_ai_message_chunks）会用合并后的
             # tool_call_chunks 重新构造 chunk，触发 init_tool_calls 校验器——它对
             # 残缺 args 宽容解析为 {}，把 invalid_tool_calls 误判为合法 tool_calls
