@@ -13,14 +13,15 @@ invoke/stream 入口先做 _repair_checkpoint_state：修复并写回 checkpoint
 屏蔽底层 agent（图结构、工具、LLM）差异。
 
 注意：本模块不能使用 `from __future__ import annotations`——langgraph 会用本模块的
-globals 求值 AgentState 的 `Annotated[...]` 注解，字符串化会导致 NameError。
+globals 求值 AgentState 的 `Annotated[...]` 注解，字符串化会导致 NameError
+（1.2.11 仍是该求值机制）。
 """
 import asyncio
 import json
 import logging
-import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated, Any, TypedDict, cast
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -40,8 +41,8 @@ from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from pydantic import BaseModel, ConfigDict
 from langgraph.runtime import Runtime
+from pydantic import BaseModel, ConfigDict
 from lang_agent.core.events import (
     EVENT_DONE,
     EVENT_ERROR,
@@ -95,8 +96,8 @@ def should_continue(state: AgentState) -> str:
 class AgentContext(BaseModel):
     """每次 run 的静态上下文：LLM 与工具集。
 
-    langgraph 0.6 的 context 特性：不写入 checkpoint、run 内只读、共享给所有节点。
-    节点通过注入的 runtime 对象访问（runtime.context）——0.6.11 不支持以
+    langgraph 1.x 的 context 特性：不写入 checkpoint、run 内只读、共享给所有节点。
+    节点通过注入的 runtime 对象访问（runtime.context）——1.2.11 仍不支持以
     `context` 参数名直接注入节点函数。
     """
 
@@ -106,7 +107,7 @@ class AgentContext(BaseModel):
     summarizer_llm: BaseChatModel | None = None  # context 压缩的摘要模型，缺省复用 llm
 
 
-@dataclass
+@dataclass(slots=True)
 class AgentLoopConfig:
     checkpointer_kind: str = "memory"  # "memory" | "sqlite"
     db_path: str = "~/.lang-agent/checkpoints.sqlite"
@@ -135,9 +136,12 @@ async def build_checkpointer(config: AgentLoopConfig):
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
         if config.db_path != ":memory:":
-            parent = os.path.dirname(os.path.abspath(config.db_path))
-            os.makedirs(parent, exist_ok=True)
-        conn = await aiosqlite.connect(config.db_path)
+            # expanduser：os.path.abspath 不展开 ~，会在工作目录下建出字面量 ~ 目录
+            db_path = Path(config.db_path).expanduser()
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = await aiosqlite.connect(str(db_path))
+        else:
+            conn = await aiosqlite.connect(config.db_path)
         return AsyncSqliteSaver(conn)
     if config.checkpointer_kind == "memory":
         from langgraph.checkpoint.memory import InMemorySaver
@@ -184,11 +188,11 @@ class AgentLoop:
 
     def _build_graph(self):
         async def agent_node(
-            state: AgentState, config: RunnableConfig, runtime: Runtime
+            state: AgentState, config: RunnableConfig, runtime: Runtime[AgentContext]
         ) -> dict[str, list[BaseMessage]]:
             # agent 节点：流式调用 LLM 并合并 chunk，保证 token 级事件可被捕获。
             # 必须把 config 传给 astream：否则 bind_tools 的 RunnableBinding 内层
-            # 模型收不到回调，token 级流式事件会丢失（langgraph 0.6 行为）。
+            # 模型收不到回调，token 级流式事件会丢失（1.x 仍是该机制）。
             # LLM 与工具集从 runtime.context 取（每次 run 注入，见 AgentContext）。
             # 历史在 invoke/stream 入口已修复并写回 checkpoint，这里原样使用。
             context = cast(AgentContext, runtime.context)
@@ -266,8 +270,7 @@ class AgentLoop:
                 for k, invalid in enumerate(message.invalid_tool_calls or []):
                     result.append(
                         ToolMessage(
-                            content="工具调用格式错误: %s"
-                            % (invalid.get("error") or "参数解析失败"),
+                            content=f"工具调用格式错误: {invalid.get('error') or '参数解析失败'}",
                             tool_call_id=invalid.get("id") or f"{INVALID_ID_PREFIX}{base_index}_{k}",
                             name=invalid.get("name") or "unknown_tool",
                         )
@@ -275,7 +278,7 @@ class AgentLoop:
             return {"messages": result}
 
         async def tools_node(
-            state: AgentState, config: RunnableConfig, runtime: Runtime
+            state: AgentState, config: RunnableConfig, runtime: Runtime[AgentContext]
         ) -> dict[str, list[BaseMessage]]:
             # 工具节点：按每次 run 的 context 工具集构建 ToolNode 并执行
             # （ToolNode 是普通 Runnable，ainvoke 返回 {"messages": [...]} 更新）。
@@ -510,7 +513,7 @@ class AgentLoop:
                                             isinstance(message, AIMessage)
                                             and isinstance(message.content, str)
                                             and message.content
-                                            and not message.tool_calls 
+                                            and not message.tool_calls
                                             and not message.invalid_tool_calls
                                         ):
                                             final_text = message.content

@@ -9,7 +9,7 @@
 """
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from langchain_core.messages import (
     AIMessage,
@@ -26,32 +26,32 @@ EVENT_DONE = "done"
 EVENT_ERROR = "error"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AgentEvent:
     type: str
-    data: Dict[str, Any]
+    data: dict[str, Any]
 
     def to_sse(self) -> str:
         """序列化为 SSE 帧：event: <type>\\ndata: <json>\\n\\n"""
-        return "event: %s\ndata: %s\n\n" % (
-            self.type,
-            json.dumps(self.data, ensure_ascii=False),
+        return (
+            f"event: {self.type}\n"
+            f"data: {json.dumps(self.data, ensure_ascii=False)}\n\n"
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class ConversationResult:
     """invoke() 的同步结果。messages 与 tool_calls 都只含本轮（最后一条 HumanMessage 起）产生的内容。"""
 
     thread_id: str
     final_text: str
-    messages: List[BaseMessage] = field(default_factory=list)
-    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    messages: list[BaseMessage] = field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 def classify_message_chunk(
-    chunk: BaseMessage, metadata: Dict[str, Any]
-) -> Optional[AgentEvent]:
+    chunk: BaseMessage, metadata: dict[str, Any]
+) -> AgentEvent | None:
     """messages 通道的 chunk 分类：agent 节点的文本 token → llm_token。"""
     if metadata.get("langgraph_node") != "agent":
         return None
@@ -60,9 +60,9 @@ def classify_message_chunk(
     return None
 
 
-def classify_node_update(node: str, delta: Dict[str, Any]) -> List[AgentEvent]:
+def classify_node_update(node: str, delta: dict[str, Any]) -> list[AgentEvent]:
     """updates 通道的节点增量分类：agent → tool_call；tools → tool_result。"""
-    events: List[AgentEvent] = []
+    events: list[AgentEvent] = []
     for message in delta.get("messages", []):
         if node == "agent" and isinstance(message, AIMessage):
             for tool_call in message.tool_calls or []:
@@ -90,7 +90,7 @@ def classify_node_update(node: str, delta: Dict[str, Any]) -> List[AgentEvent]:
     return events
 
 
-def messages_after_last_human(messages: List[BaseMessage]) -> List[BaseMessage]:
+def messages_after_last_human(messages: list[BaseMessage]) -> list[BaseMessage]:
     """截取最近一条 HumanMessage 起的本轮消息（含其后的 AIMessage/ToolMessage）。
 
     每次 invoke 都会追加一条新的 HumanMessage，因此最后一条 HumanMessage
@@ -102,9 +102,9 @@ def messages_after_last_human(messages: List[BaseMessage]) -> List[BaseMessage]:
     return messages
 
 
-def collect_tool_calls(messages: List[BaseMessage]) -> List[Dict[str, Any]]:
+def collect_tool_calls(messages: list[BaseMessage]) -> list[dict[str, Any]]:
     """汇总给定消息范围内 AIMessage 发起过的工具调用（调用方负责传本轮切片）。"""
-    tool_calls: List[Dict[str, Any]] = []
+    tool_calls: list[dict[str, Any]] = []
     for message in messages:
         if isinstance(message, AIMessage):
             for tool_call in message.tool_calls or []:

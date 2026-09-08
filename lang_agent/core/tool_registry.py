@@ -1,6 +1,7 @@
 """工具注册表：内置演示工具 + 扩展口（不做 tool 鉴权）。"""
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Type
+from typing import Any
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel
@@ -10,17 +11,17 @@ from langchain_community.agent_toolkits.file_management import FileManagementToo
 from langchain_community.agent_toolkits.load_tools import load_tools
 
 
-@dataclass
+@dataclass(slots=True)
 class ToolSpec:
     """一个工具的完整描述。"""
 
     name: str
     description: str
     fn: Callable[..., Any]
-    args_schema: Optional[Type[BaseModel]] = None
+    args_schema: type[BaseModel] | None = None
 
 
-_TOOLS: Dict[str, ToolSpec] = {}
+_TOOLS: dict[str, ToolSpec] = {}
 
 
 def register_tool(spec: ToolSpec) -> None:
@@ -36,10 +37,10 @@ def get_tool(name: str) -> ToolSpec:
     try:
         return _TOOLS[name]
     except KeyError:
-        raise ValueError("未知工具: %r，已注册: %s" % (name, sorted(_TOOLS)))
+        raise ValueError(f"未知工具: {name!r}，已注册: {sorted(_TOOLS)}")
 
 
-def instantiate_tools(names: Optional[List[str]] = None) -> List[BaseTool]:
+def instantiate_tools(names: list[str] | None = None) -> list[BaseTool]:
     """把注册表转为 langchain BaseTool 列表，供 bind_tools / ToolNode 使用。"""
     specs = [_TOOLS[n] for n in names] if names else list(_TOOLS.values())
     return [

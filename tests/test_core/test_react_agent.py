@@ -124,6 +124,17 @@ async def test_sqlite_checkpointer_persists_across_instances(tmp_path):
         assert isinstance(seen[-1], HumanMessage) and seen[-1].content == "第二问"
 
 
+async def test_build_checkpointer_expands_tilde(tmp_path, monkeypatch):
+    # db_path 的 ~ 必须展开到 HOME：不展开会在工作目录下建出字面量 ~ 目录
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = AgentLoopConfig(checkpointer_kind="sqlite", db_path="~/ck.sqlite")
+    saver = await build_checkpointer(config)
+    try:
+        assert (tmp_path / "ck.sqlite").exists()
+    finally:
+        await saver.conn.close()
+
+
 async def test_tool_calls_only_summarize_current_round():
     # 第一轮触发工具调用，第二轮纯文本：第二轮结果不应包含第一轮的 tool_calls
     loop, _ = make_loop(

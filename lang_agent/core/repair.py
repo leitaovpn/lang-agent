@@ -20,14 +20,14 @@ LLM 对消息历史的硬性要求（本项目必须满足）：
 - invalid_tool_calls（解析失败的调用）→ 合成「格式错误」反馈 ToolMessage，
   其 id 形如 invalid_<aimessage下标>_<条内序号>，幂等（已存在则不重复合成）。
 """
-from typing import cast
+from typing import Any, cast
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
 INVALID_ID_PREFIX = "invalid_"
 
 
-def _unique_id(used: set, base: str) -> str:
+def _unique_id(used: set[str], base: str) -> str:
     call_id = base
     k = 1
     while call_id in used:
@@ -51,13 +51,13 @@ def _repair_from(messages: list[BaseMessage], start_ai: int) -> list[BaseMessage
     # 前缀按归纳不变式信任；其 tool_call_id 不参与去重
     # （唯一性只要求「两个 AIMessage 之间」不重合）
     repaired = list(messages[:start_ai])
-    used: set = set()
+    used: set[str] = set()
 
     message = cast(AIMessage, messages[start_ai])
     # 1) 尾部 tool_calls id 唯一化（与历史全局去重）
-    calls = []
-    for k, call in enumerate(message.tool_calls or []):
-        call = dict(call)
+    calls: list[dict[str, Any]] = []
+    for k, raw in enumerate(message.tool_calls or []):
+        call: dict[str, Any] = dict(raw)
         call_id_base = call.get("id")
         call["id"] = _unique_id(
             used, str(call_id_base) if call_id_base else f"call_{start_ai}_{k}"
@@ -81,7 +81,7 @@ def _repair_from(messages: list[BaseMessage], start_ai: int) -> list[BaseMessage
             repaired.append(tm.model_copy(update={"tool_call_id": call["id"]}))
     else:
         # 数量不一致：按 id 匹配；重复/孤儿丢弃，缺失的补错误消息
-        seen = set()
+        seen: set[str] = set()
         for tm in tool_msgs:
             tid = tm.tool_call_id
             if tid in seen:
@@ -107,8 +107,7 @@ def _repair_from(messages: list[BaseMessage], start_ai: int) -> list[BaseMessage
             continue
         repaired.append(
             ToolMessage(
-                content="工具调用格式错误: %s"
-                % (invalid.get("error") or "参数解析失败"),
+                content=f"工具调用格式错误: {invalid.get('error') or '参数解析失败'}",
                 tool_call_id=tid,
                 name=invalid.get("name") or "unknown_tool",
             )

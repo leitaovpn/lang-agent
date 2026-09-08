@@ -7,7 +7,6 @@
 import argparse
 import json
 import sys
-from typing import Dict, List, Optional
 
 import httpx
 
@@ -17,13 +16,13 @@ from lang_agent.agent.config import DEFAULT_HOST, DEFAULT_PORT
 def _build_payload(
     *,
     message: str,
-    model: Optional[str],
-    provider: Optional[str],
-    protocol: Optional[str],
-    thread_id: Optional[str],
-) -> Dict[str, str]:
+    model: str | None,
+    provider: str | None,
+    protocol: str | None,
+    thread_id: str | None,
+) -> dict[str, str]:
     """组装 /chat 请求体：None 的字段不传，走服务端默认值。"""
-    payload: Dict[str, str] = {"message": message}
+    payload: dict[str, str] = {"message": message}
     if model:
         payload["model"] = model
     if provider:
@@ -65,7 +64,7 @@ def _chat(args) -> int:
     return 0
 
 
-def _chat_stream(base_url: str, payload: Dict[str, str]) -> int:
+def _chat_stream(base_url: str, payload: dict[str, str]) -> int:
     """SSE 流式打印：llm_token 实时输出，tool 过程灰显，error 走 stderr 退出码 1。"""
     saw_token = False
     try:
@@ -110,7 +109,7 @@ def _serve(args) -> int:
     return 0
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="lang-agent", description="lang-agent CLI")
     sub = parser.add_subparsers(dest="command")
 
