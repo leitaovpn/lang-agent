@@ -16,6 +16,7 @@ invoke/stream 入口先做 _repair_checkpoint_state：修复并写回 checkpoint
 globals 求值 AgentState 的 `Annotated[...]` 注解，字符串化会导致 NameError。
 """
 import asyncio
+import json
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -210,13 +211,59 @@ class AgentLoop:
             merged = cast(AIMessageChunk, chunks[0])
             for chunk in chunks[1:]:
                 merged = merged + cast(AIMessageChunk, chunk)
-            result: list[BaseMessage] = [merged]  # type: ignore
-            if not merged.tool_calls:  # type: ignore
+            # langchain-core 1.x：chunk 合并（add_ai_message_chunks）会用合并后的
+            # tool_call_chunks 重新构造 chunk，触发 init_tool_calls 校验器——它对
+            # 残缺 args 宽容解析为 {}，把 invalid_tool_calls 误判为合法 tool_calls
+            # （0.3.x 无此行为）。tool_call_chunks 保留原始 args 字符串，这里用严格
+            # json 解析重建合法/非法判定（合法调用的最终 args 必为完整 JSON）。
+            tool_calls: list[dict[str, Any]] = []
+            invalid_tool_calls: list[dict[str, Any]] = []
+            for raw in merged.tool_call_chunks:
+                name = raw.get("name") or ""
+                args_raw = raw.get("args")
+                if isinstance(args_raw, dict):
+                    args: Any = args_raw
+                elif args_raw:
+                    try:
+                        args = json.loads(args_raw)
+                    except json.JSONDecodeError:
+                        args = None
+                else:
+                    args = {}
+                if isinstance(args, dict):
+                    tool_calls.append(
+                        {"name": name, "args": args, "id": raw.get("id"), "type": "tool_call"}
+                    )
+                else:
+                    invalid_tool_calls.append(
+                        {
+                            "name": name,
+                            "args": args_raw or "",
+                            "id": raw.get("id"),
+                            "type": "invalid_tool_call",
+                            "error": None,
+                        }
+                    )
+            # 转成普通 AIMessage 返回：AIMessageChunk（无论合并与否）经 checkpointer
+            # 序列化往返同样会触发 init_tool_calls 重建造成误判，普通 AIMessage
+            # 无此校验器，invalid_tool_calls 可原样往返。
+            message = AIMessage(
+                content=merged.content,
+                tool_calls=tool_calls,
+                invalid_tool_calls=invalid_tool_calls,
+                additional_kwargs=merged.additional_kwargs,
+                response_metadata=merged.response_metadata,
+                usage_metadata=merged.usage_metadata,
+                id=merged.id,
+                name=merged.name,
+            )
+            result: list[BaseMessage] = [message]
+            if not message.tool_calls:
                 # 无合法调用：为解析失败的调用附错误反馈 ToolMessage，驱动循环重试。
                 # id 与 repair 层的确定性 id 一致（invalid_<消息下标>_<条内序号>），
                 # 避免下一轮修复时重复合成。
                 base_index = len(state["messages"])
-                for k, invalid in enumerate(merged.invalid_tool_calls or []):  # type: ignore
+                for k, invalid in enumerate(message.invalid_tool_calls or []):
                     result.append(
                         ToolMessage(
                             content="工具调用格式错误: %s"
@@ -232,8 +279,11 @@ class AgentLoop:
         ) -> dict[str, list[BaseMessage]]:
             # 工具节点：按每次 run 的 context 工具集构建 ToolNode 并执行
             # （ToolNode 是普通 Runnable，ainvoke 返回 {"messages": [...]} 更新）。
+            # 必须显式 handle_tool_errors=True：1.x 默认只把 ToolInvocationError 转
+            # 错误 ToolMessage，其余工具异常直接上抛；显式 True 恢复 0.6.x 语义
+            # （任何工具异常 → 错误 ToolMessage 投喂 LLM，循环继续）。
             context = cast(AgentContext, runtime.context)
-            tool_node = ToolNode(context.tools)
+            tool_node = ToolNode(context.tools, handle_tool_errors=True)
             return await tool_node.ainvoke(state, config)
 
         graph = StateGraph(AgentState, context_schema=AgentContext)
