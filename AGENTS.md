@@ -24,7 +24,7 @@ lang-agent：基于 langgraph 的 lang agent，分三层：
 .venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "..." --stream  # CLI 冒烟
 ```
 
-没有 CI 配置；lint 与类型检查工具已锁进 dev 依赖：
+lint 与类型检查工具已锁进 dev 依赖：
 
 ```bash
 .venv_3.13/bin/ruff check lang_agent/ tests/                                   # lint
@@ -32,6 +32,12 @@ lang-agent：基于 langgraph 的 lang agent，分三层：
 ```
 
 IDE 类型诊断与运行时同为 Python 3.13，可直接以诊断为准。
+
+### 提交门禁（push / merge 前自动校验）
+
+- **本地钩子**（`.githooks/`）：`pre-push` 与 `pre-merge-commit` 都会跑 ruff + mypy + pytest 全量校验，任一失败即中止。一次性启用：`git config core.hooksPath .githooks`（新克隆需重新执行）。
+- **CI**（`.github/workflows/ci.yml`）：push 与 PR 双触发，跑同一套校验（ubuntu + Python 3.13）。
+- **合并门禁**：PR 合并前要求 CI 通过，需在 GitHub 仓库 Settings → Branches 对 main 开启 branch protection，勾选 Require status checks（`checks` job）。本地 `git merge`（非 fast-forward）由 pre-merge-commit 钩子把关；ff 合并的分支已在 push 时被校验。
 
 ## 架构要点
 

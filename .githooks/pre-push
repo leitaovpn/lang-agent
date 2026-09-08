@@ -1,0 +1,3 @@
+#!/bin/sh
+# 推送前跑全量校验，失败则中止 push
+exec "$(dirname "$0")/_run_checks.sh"
