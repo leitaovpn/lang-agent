@@ -2,9 +2,13 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
 from langchain_core.messages import AIMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
-from lang_agent.agent.server import app, build_loop
-from lang_agent.core import AgentLoop
+from lang_agent.agent.deps import ChatDeps
+from lang_agent.agent.server import app, build_deps
+from lang_agent.agent.session import ChatSession
+from lang_agent.core import AgentContext, AgentLoop, AgentLoopConfig
+from lang_agent.core.tool_registry import instantiate_tools
 from tests.conftest import FakeChatModel
 
 TOOL_CALL = {
@@ -16,14 +20,19 @@ TOOL_CALL = {
 
 
 @pytest.fixture
-def override_loop():
-    """把 build_loop 依赖替换为给定脚本的 FakeChatModel 循环；返回清理函数。"""
+def override_deps():
+    """把 build_deps 依赖替换为给定脚本的 FakeChatModel 会话；返回清理函数。"""
 
     def set_override(script):
         async def _factory(request=None):
-            return AgentLoop(llm=FakeChatModel(responses=list(script)))
+            llm = FakeChatModel(responses=list(script))
+            loop = AgentLoop(config=AgentLoopConfig(), checkpointer=InMemorySaver())
+            return ChatDeps(
+                session=ChatSession(loop=loop, config=AgentLoopConfig()),
+                context=AgentContext(llm=llm, tools=instantiate_tools()),
+            )
 
-        app.dependency_overrides[build_loop] = _factory
+        app.dependency_overrides[build_deps] = _factory
         return lambda: app.dependency_overrides.clear()
 
     yield set_override
@@ -36,8 +45,8 @@ async def client():
         yield c
 
 
-async def test_chat_endpoint(client, override_loop):
-    cleanup = override_loop([AIMessage(content="答案是 42")])
+async def test_chat_endpoint(client, override_deps):
+    cleanup = override_deps([AIMessage(content="答案是 42")])
     try:
         resp = await client.post("/chat", json={"message": "1+1 等于几"})
     finally:
@@ -49,8 +58,8 @@ async def test_chat_endpoint(client, override_loop):
     assert data["tool_calls"] == []
 
 
-async def test_chat_endpoint_with_tool_round(client, override_loop):
-    cleanup = override_loop(
+async def test_chat_endpoint_with_tool_round(client, override_deps):
+    cleanup = override_deps(
         [AIMessage(content="", tool_calls=[TOOL_CALL]), AIMessage(content="结果是 56")]
     )
     try:
@@ -71,14 +80,14 @@ async def test_chat_unknown_provider_returns_400(client, monkeypatch):
 
         raise UnknownProviderError("未知 provider: 'nope'，已注册: ['deepseek']")
 
-    monkeypatch.setattr(server_mod, "get_loop", boom)
+    monkeypatch.setattr(server_mod, "get_deps", boom)
     resp = await client.post("/chat", json={"message": "hi", "provider": "nope"})
     assert resp.status_code == 400
     assert "nope" in resp.json()["detail"]
 
 
-async def test_stream_endpoint_sse(client, override_loop):
-    cleanup = override_loop(
+async def test_stream_endpoint_sse(client, override_deps):
+    cleanup = override_deps(
         [AIMessage(content="", tool_calls=[TOOL_CALL]), AIMessage(content="结果是 56")]
     )
     try:

@@ -1,4 +1,4 @@
-"""core 层：手搓 StateGraph 的完整 ReAct agent loop。
+"""core 层：ReAct agent loop 的纯 graph 薄封装。
 
 拓扑：
     START → agent（LLM + bind_tools，流式合并）
@@ -6,20 +6,20 @@
               ├─ 只有 invalid_tool_calls（已附错误反馈）→ agent（重试）
               └─ 有 tool_calls → tools（ToolNode 执行真实工具）→ agent（回环）
 
-invoke/stream 入口先做 _repair_checkpoint_state：修复并写回 checkpoint 里的历史，
-避免下次拉取到错误消息。
+AgentLoop 只负责构建与编译 graph；invoke/stream 与 `graph.ainvoke/astream`
+完全同形透传（输入/输出均不塑形）。llm/tools 每次 run 经 `context=` 注入
+（AgentContext），本模块不持有任何 LLM/工具——invoke/stream 的 context 为必传。
 
-用 checkpointer 按 thread_id 记忆多轮对话；对外统一暴露 invoke / stream，
-屏蔽底层 agent（图结构、工具、LLM）差异。
+checkpoint 修复、context 压缩、重试续跑、结果塑形与事件分类等入口逻辑
+在 agent 层（lang_agent/agent/session.py），经 `AgentLoop.graph` 访问
+aget_state/aupdate_state 实现。
 
 注意：本模块不能使用 `from __future__ import annotations`——langgraph 会用本模块的
 globals 求值 AgentState 的 `Annotated[...]` 注解，字符串化会导致 NameError
 （1.2.11 仍是该求值机制）。
 """
-import asyncio
 import json
-import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, TypedDict, cast
@@ -31,38 +31,21 @@ from langchain_core.messages import (
     AnyMessage,
     BaseMessage,
     BaseMessageChunk,
-    HumanMessage,
-    RemoveMessage,
     SystemMessage,
     ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, ConfigDict
 
-from lang_agent.core.compress import (
-    estimate_tokens,
-    find_round_start,
-    render_messages_for_summary,
-    truncate_tool_outputs,
-)
-from lang_agent.core.events import (
-    EVENT_DONE,
-    EVENT_ERROR,
-    AgentEvent,
-    ConversationResult,
-    classify_message_chunk,
-    classify_node_update,
-    collect_tool_calls,
-    messages_after_last_human,
-)
-from lang_agent.core.repair import INVALID_ID_PREFIX, repair_state_for_checkpoint
-from lang_agent.core.retry import compute_delay, is_retryable
-from lang_agent.core.tool_registry import instantiate_tools
+from lang_agent.core.compress import truncate_tool_outputs
+from lang_agent.core.repair import INVALID_ID_PREFIX
 
 AGENT_NODE = "agent"
 TOOLS_NODE = "tools"
@@ -95,7 +78,7 @@ def should_continue(state: AgentState) -> str:
 
 
 class AgentContext(BaseModel):
-    """每次 run 的静态上下文：LLM 与工具集。
+    """每次 run 的静态上下文：LLM 与工具集（每次 invoke/stream 经 context= 注入）。
 
     langgraph 1.x 的 context 特性：不写入 checkpoint、run 内只读、共享给所有节点。
     节点通过注入的 runtime 对象访问（runtime.context）——1.2.11 仍不支持以
@@ -110,19 +93,146 @@ class AgentContext(BaseModel):
 
 @dataclass(slots=True)
 class AgentLoopConfig:
+    """agent 循环配置（被动数据，逐字段标注消费层）。"""
+
+    # core 消费：checkpointer 构建（build_checkpointer）
     checkpointer_kind: str = "memory"  # "memory" | "sqlite"
     db_path: str = "~/.lang-agent/checkpoints.sqlite"
+    # core 消费：默认 agent 节点构造时闭包捕获（构造后改配置不生效）
+    compress_tool_output_max_chars: int = 2000  # 发送视图工具输出截断上限
+    # agent 层消费：_run_config
     recursion_limit: int = 25
-    # graph 调用异常重试（瞬时异常白名单 + 指数退避）
+    # agent 层消费：graph 调用异常重试（瞬时异常白名单 + 指数退避）
     retry_max_attempts: int = 3  # 总尝试次数（含首次）
     retry_base_delay: float = 0.5  # 首次退避秒数
     retry_backoff_factor: float = 2.0  # 指数退避因子
     retryable_exceptions: tuple[type[BaseException], ...] | None = None  # None → 默认白名单（见 core/retry.py）
-    # context 压缩（摘要 + 保留窗口 + 工具输出截断，见 core/compress.py）
+    # agent 层消费：context 压缩（摘要 + 保留窗口 + 工具输出截断，见 core/compress.py）
     compress_enabled: bool = True
     compress_token_threshold: int = 8000  # 估算 token 超此阈值触发压缩
     compress_keep_last: int = 8  # 保留最近 N 条完整消息
-    compress_tool_output_max_chars: int = 2000  # 发送视图工具输出截断上限
+
+
+ReActNode = Callable[
+    [AgentState, RunnableConfig, Runtime[AgentContext]],
+    Awaitable[dict[str, list[BaseMessage]]],
+]
+"""ReAct 节点签名：state/config 由 langgraph 注入，runtime.context 取 AgentContext。"""
+
+
+def build_default_agent_node(compress_tool_output_max_chars: int = 2000) -> ReActNode:
+    """默认 agent 节点：流式调用 context 的 LLM 并合并 chunk，保证 token 级事件可被捕获。
+
+    - 必须把 config 传给 astream：否则 bind_tools 的 RunnableBinding 内层
+      模型收不到回调，token 级流式事件会丢失（1.x 仍是该机制）。
+    - LLM 与工具集从 runtime.context 取（每次 run 注入，见 AgentContext）。
+    - chunk 合并后转普通 AIMessage 并用严格 json 从 tool_call_chunks 重建
+      合法/非法判定（langchain-core 1.x 的 chunk 合并/序列化会把
+      invalid_tool_calls 误判为合法调用，详见 AGENTS.md 已知坑）。
+    """
+
+    async def agent_node(
+        state: AgentState, config: RunnableConfig, runtime: Runtime[AgentContext]
+    ) -> dict[str, list[BaseMessage]]:
+        context = cast(AgentContext, runtime.context)
+        model = context.llm.bind_tools(context.tools)
+        # 发送视图：system 提示 + 摘要前缀 + 截断后的历史（截断不写回 checkpoint）
+        messages: list[BaseMessage] = list(state["messages"])
+        prefix: list[BaseMessage] = []
+        if state.get("system"):
+            prefix.append(SystemMessage(content=state["system"]))
+        if state.get("summary"):
+            prefix.append(SystemMessage(content="早期对话摘要:\n" + state["summary"]))
+        messages = truncate_tool_outputs(prefix + messages, compress_tool_output_max_chars)
+        chunks: list[BaseMessageChunk] = []
+        async for chunk in model.astream(messages, config=config):
+            chunks.append(cast(BaseMessageChunk, chunk))
+        if not chunks:
+            return {"messages": []}
+        merged = cast(AIMessageChunk, chunks[0])
+        for other in chunks[1:]:
+            merged = merged + cast(AIMessageChunk, other)
+        # langchain-core 1.x：chunk 合并（add_ai_message_chunks）会用合并后的
+        # tool_call_chunks 重新构造 chunk，触发 init_tool_calls 校验器——它对
+        # 残缺 args 宽容解析为 {}，把 invalid_tool_calls 误判为合法 tool_calls
+        # （0.3.x 无此行为）。tool_call_chunks 保留原始 args 字符串，这里用严格
+        # json 解析重建合法/非法判定（合法调用的最终 args 必为完整 JSON）。
+        tool_calls: list[dict[str, Any]] = []
+        invalid_tool_calls: list[dict[str, Any]] = []
+        for raw in merged.tool_call_chunks:
+            name = raw.get("name") or ""
+            args_raw = raw.get("args")
+            if isinstance(args_raw, dict):
+                args: Any = args_raw
+            elif args_raw:
+                try:
+                    args = json.loads(args_raw)
+                except json.JSONDecodeError:
+                    args = None
+            else:
+                args = {}
+            if isinstance(args, dict):
+                tool_calls.append(
+                    {"name": name, "args": args, "id": raw.get("id"), "type": "tool_call"}
+                )
+            else:
+                invalid_tool_calls.append(
+                    {
+                        "name": name,
+                        "args": args_raw or "",
+                        "id": raw.get("id"),
+                        "type": "invalid_tool_call",
+                        "error": None,
+                    }
+                )
+        # 转成普通 AIMessage 返回：AIMessageChunk（无论合并与否）经 checkpointer
+        # 序列化往返同样会触发 init_tool_calls 重建造成误判，普通 AIMessage
+        # 无此校验器，invalid_tool_calls 可原样往返。
+        message = AIMessage(
+            content=merged.content,
+            tool_calls=tool_calls,
+            invalid_tool_calls=invalid_tool_calls,
+            additional_kwargs=merged.additional_kwargs,
+            response_metadata=merged.response_metadata,
+            usage_metadata=merged.usage_metadata,
+            id=merged.id,
+            name=merged.name,
+        )
+        result: list[BaseMessage] = [message]
+        if not message.tool_calls:
+            # 无合法调用：为解析失败的调用附错误反馈 ToolMessage，驱动循环重试。
+            # id 与 repair 层的确定性 id 一致（invalid_<消息下标>_<条内序号>），
+            # 避免下一轮修复时重复合成。
+            base_index = len(state["messages"])
+            for k, invalid in enumerate(message.invalid_tool_calls or []):
+                result.append(
+                    ToolMessage(
+                        content=f"工具调用格式错误: {invalid.get('error') or '参数解析失败'}",
+                        tool_call_id=invalid.get("id") or f"{INVALID_ID_PREFIX}{base_index}_{k}",
+                        name=invalid.get("name") or "unknown_tool",
+                    )
+                )
+        return {"messages": result}
+
+    return agent_node
+
+
+def build_default_tools_node() -> ReActNode:
+    """默认工具节点：按每次 run 的 context 工具集构建 ToolNode 并执行。
+
+    必须显式 handle_tool_errors=True：1.x 默认只把 ToolInvocationError 转
+    错误 ToolMessage，其余工具异常直接上抛；显式 True 恢复 0.6.x 语义
+    （任何工具异常 → 错误 ToolMessage 投喂 LLM，循环继续）。
+    """
+
+    async def tools_node(
+        state: AgentState, config: RunnableConfig, runtime: Runtime[AgentContext]
+    ) -> dict[str, list[BaseMessage]]:
+        context = cast(AgentContext, runtime.context)
+        tool_node = ToolNode(context.tools, handle_tool_errors=True)
+        return await tool_node.ainvoke(state, config)
+
+    return tools_node
 
 
 async def build_checkpointer(config: AgentLoopConfig):
@@ -151,20 +261,24 @@ async def build_checkpointer(config: AgentLoopConfig):
 
 
 class AgentLoop:
-    """ReAct agent 循环统一入口。
+    """ReAct agent 循环的纯 graph 薄封装。
 
-    - invoke(query, *, thread_id, system) -> ConversationResult：一次性拿最终结果
-    - stream(query, *, thread_id, system)：异步迭代产出 AgentEvent（token 级流式）
+    - 构造时只编译 graph（checkpointer、config、可选注入的 agent_node/tools_node）；
+      不持有任何 LLM/工具。
+    - invoke/stream 与 `graph.ainvoke/astream` 完全同形透传：输入/输出均不塑形，
+      stream 产出原始 (mode, payload) 元组（stream_mode 为列表时）。
+    - llm/tools 每次 run 经 `context=`（AgentContext）必传注入，由调用方
+      （agent 层）构造；缺省节点工厂见 build_default_agent_node / build_default_tools_node。
     """
 
     def __init__(
         self,
-        llm: BaseChatModel,
-        tools: list[BaseTool] | None = None,
+        *,
+        checkpointer: BaseCheckpointSaver | None = None,
         config: AgentLoopConfig | None = None,
-        checkpointer=None,
-    ):
-        self._llm = llm
+        agent_node: ReActNode | None = None,
+        tools_node: ReActNode | None = None,
+    ) -> None:
         self._config = config or AgentLoopConfig()
         if checkpointer is not None:
             self._checkpointer = checkpointer
@@ -177,118 +291,16 @@ class AgentLoop:
                 "sqlite checkpointer 必须在异步上下文中创建："
                 "请先 await build_checkpointer(config) 再注入 checkpointer 参数"
             )
-        self._tools = self._build_tools(tools)
-        self._context = AgentContext(llm=self._llm, tools=self._tools)
-        self._graph = self._build_graph()
+        # 默认节点在构造时捕获 config 的截断参数（构造后改配置不生效）
+        self._graph = self._build_graph(
+            agent_node
+            or build_default_agent_node(self._config.compress_tool_output_max_chars),
+            tools_node or build_default_tools_node(),
+        )
 
-    def _build_tools(self, tools: list[BaseTool] | None = None) -> list[BaseTool]:
-        """按配置构建工具列表（可被子类覆盖）。"""
-        default_tools = instantiate_tools()
-        return default_tools + (tools or [])
-
-    def _build_graph(self):
-        async def agent_node(
-            state: AgentState, config: RunnableConfig, runtime: Runtime[AgentContext]
-        ) -> dict[str, list[BaseMessage]]:
-            # agent 节点：流式调用 LLM 并合并 chunk，保证 token 级事件可被捕获。
-            # 必须把 config 传给 astream：否则 bind_tools 的 RunnableBinding 内层
-            # 模型收不到回调，token 级流式事件会丢失（1.x 仍是该机制）。
-            # LLM 与工具集从 runtime.context 取（每次 run 注入，见 AgentContext）。
-            # 历史在 invoke/stream 入口已修复并写回 checkpoint，这里原样使用。
-            context = cast(AgentContext, runtime.context)
-            model = context.llm.bind_tools(context.tools)
-            # 发送视图：system 提示 + 摘要前缀 + 截断后的历史（截断不写回 checkpoint）
-            messages: list[BaseMessage] = list(state["messages"])
-            prefix: list[BaseMessage] = []
-            if state.get("system"):
-                prefix.append(SystemMessage(content=state["system"]))
-            if state.get("summary"):
-                prefix.append(SystemMessage(content="早期对话摘要:\n" + state["summary"]))
-            messages = truncate_tool_outputs(
-                prefix + messages, self._config.compress_tool_output_max_chars
-            )
-            chunks: list[BaseMessageChunk] = []
-            async for chunk in model.astream(messages, config=config):
-                chunks.append(cast(BaseMessageChunk, chunk))
-            if not chunks:
-                return {"messages": []}
-            merged = cast(AIMessageChunk, chunks[0])
-            for other in chunks[1:]:
-                merged = merged + cast(AIMessageChunk, other)
-            # langchain-core 1.x：chunk 合并（add_ai_message_chunks）会用合并后的
-            # tool_call_chunks 重新构造 chunk，触发 init_tool_calls 校验器——它对
-            # 残缺 args 宽容解析为 {}，把 invalid_tool_calls 误判为合法 tool_calls
-            # （0.3.x 无此行为）。tool_call_chunks 保留原始 args 字符串，这里用严格
-            # json 解析重建合法/非法判定（合法调用的最终 args 必为完整 JSON）。
-            tool_calls: list[dict[str, Any]] = []
-            invalid_tool_calls: list[dict[str, Any]] = []
-            for raw in merged.tool_call_chunks:
-                name = raw.get("name") or ""
-                args_raw = raw.get("args")
-                if isinstance(args_raw, dict):
-                    args: Any = args_raw
-                elif args_raw:
-                    try:
-                        args = json.loads(args_raw)
-                    except json.JSONDecodeError:
-                        args = None
-                else:
-                    args = {}
-                if isinstance(args, dict):
-                    tool_calls.append(
-                        {"name": name, "args": args, "id": raw.get("id"), "type": "tool_call"}
-                    )
-                else:
-                    invalid_tool_calls.append(
-                        {
-                            "name": name,
-                            "args": args_raw or "",
-                            "id": raw.get("id"),
-                            "type": "invalid_tool_call",
-                            "error": None,
-                        }
-                    )
-            # 转成普通 AIMessage 返回：AIMessageChunk（无论合并与否）经 checkpointer
-            # 序列化往返同样会触发 init_tool_calls 重建造成误判，普通 AIMessage
-            # 无此校验器，invalid_tool_calls 可原样往返。
-            message = AIMessage(
-                content=merged.content,
-                tool_calls=tool_calls,
-                invalid_tool_calls=invalid_tool_calls,
-                additional_kwargs=merged.additional_kwargs,
-                response_metadata=merged.response_metadata,
-                usage_metadata=merged.usage_metadata,
-                id=merged.id,
-                name=merged.name,
-            )
-            result: list[BaseMessage] = [message]
-            if not message.tool_calls:
-                # 无合法调用：为解析失败的调用附错误反馈 ToolMessage，驱动循环重试。
-                # id 与 repair 层的确定性 id 一致（invalid_<消息下标>_<条内序号>），
-                # 避免下一轮修复时重复合成。
-                base_index = len(state["messages"])
-                for k, invalid in enumerate(message.invalid_tool_calls or []):
-                    result.append(
-                        ToolMessage(
-                            content=f"工具调用格式错误: {invalid.get('error') or '参数解析失败'}",
-                            tool_call_id=invalid.get("id") or f"{INVALID_ID_PREFIX}{base_index}_{k}",
-                            name=invalid.get("name") or "unknown_tool",
-                        )
-                    )
-            return {"messages": result}
-
-        async def tools_node(
-            state: AgentState, config: RunnableConfig, runtime: Runtime[AgentContext]
-        ) -> dict[str, list[BaseMessage]]:
-            # 工具节点：按每次 run 的 context 工具集构建 ToolNode 并执行
-            # （ToolNode 是普通 Runnable，ainvoke 返回 {"messages": [...]} 更新）。
-            # 必须显式 handle_tool_errors=True：1.x 默认只把 ToolInvocationError 转
-            # 错误 ToolMessage，其余工具异常直接上抛；显式 True 恢复 0.6.x 语义
-            # （任何工具异常 → 错误 ToolMessage 投喂 LLM，循环继续）。
-            context = cast(AgentContext, runtime.context)
-            tool_node = ToolNode(context.tools, handle_tool_errors=True)
-            return await tool_node.ainvoke(state, config)
-
+    def _build_graph(
+        self, agent_node: ReActNode, tools_node: ReActNode
+    ) -> CompiledStateGraph[AgentState, AgentContext, AgentState, AgentState]:
         graph = StateGraph(AgentState, context_schema=AgentContext)
         # runtime 注入在 langgraph 类型定义之外（运行时已验证），类型检查忽略
         graph.add_node(AGENT_NODE, agent_node)  # type: ignore
@@ -298,243 +310,48 @@ class AgentLoop:
         graph.add_edge(TOOLS_NODE, AGENT_NODE)
         return graph.compile(checkpointer=self._checkpointer)
 
-    def _run_config(self, thread_id: str) -> RunnableConfig:
-        return {
-            "configurable": {"thread_id": thread_id},
-            "recursion_limit": self._config.recursion_limit,
-        }
-
-    def _initial_state(self, query: str, system: str | None) -> dict[str, Any]:
-        # system 仅在显式提供时写入：不提供则保留该 thread 既有的 system（checkpoint 恢复）
-        initial: dict[str, Any] = {
-            "messages": [HumanMessage(content=query)],
-            "raw_input": query,
-        }
-        if system:
-            initial["system"] = system
-        return initial
-
-    async def _repair_checkpoint_state(self, thread_id: str) -> None:
-        """invoke/stream 之前的入口修复：修复本地记忆（checkpoint）里的历史。
-
-        上一轮产生的坏段（重复 id、缺失 ToolMessage 等）在 checkpoint 里按原样
-        存储；本次调用开始前先修复并写回，避免下次 checkpoint 拉取到错误消息。
-
-        写回方式：add_messages reducer 对同 id 消息原位替换、新消息一律追加到
-        末尾——新合成的错误 ToolMessage 会跑到最后，破坏顺序。因此先用
-        RemoveMessage 全删再按修复后的顺序加回，精确重建消息列表
-        （此时新 HumanMessage 尚未入 state，顺序天然是 [AI, ToolMessage, ...]）。
-        """
-        config = self._run_config(thread_id)
-        state = await self._graph.aget_state(config)
-        current: list[BaseMessage] = (state.values or {}).get("messages", [])
-        if not current:
-            return
-        repaired = repair_state_for_checkpoint(list(current))
-        if repaired == current:
-            return
-        await self._graph.aupdate_state(
-            config,
-            {
-                "messages": [
-                    RemoveMessage(id=message.id)
-                    for message in current
-                    if message.id is not None
-                ]
-                + repaired
-            },
-        )
-
-    async def _compress_checkpoint_state(self, thread_id: str, ctx: AgentContext) -> None:
-        """invoke/stream 之前的入口压缩（在 _repair_checkpoint_state 之后执行）。
-
-        token 估算超阈值时：把保留窗口（compress_keep_last）之前的完整轮次交给
-        摘要模型总结，摘要写回 checkpoint 的 summary 字段、旧消息用 RemoveMessage
-        删除——切点由 find_round_start 保证落在轮起点，tool_call 段永不拆散，
-        压缩后历史仍满足 repair 不变式。未超阈值时零成本返回。
-        """
-        if not self._config.compress_enabled:
-            return
-        config = self._run_config(thread_id)
-        state = await self._graph.aget_state(config)
-        current: list[BaseMessage] = list((state.values or {}).get("messages", []))
-        if not current:
-            return
-        tokens = estimate_tokens(current, ctx.llm)
-        if tokens <= self._config.compress_token_threshold:
-            return
-        cut = find_round_start(current, len(current) - self._config.compress_keep_last)
-        if cut <= 0:
-            return  # 保留窗口已覆盖全部历史，无可压缩
-        old = current[:cut]
-        rendered = render_messages_for_summary(old)
-        prompt = (
-            "请把以下对话历史总结成简短摘要，保留：用户目标与偏好、关键结论与事实、"
-            "工具调用的重要结果。只输出摘要本身：\n\n" + rendered
-        )
-        summarizer = ctx.summarizer_llm or ctx.llm
-        response = await summarizer.ainvoke([HumanMessage(content=prompt)])
-        segment = (
-            response.content if isinstance(response.content, str) else str(response.content)
-        )
-        old_summary = (state.values or {}).get("summary") or ""
-        new_summary = (old_summary + "\n" if old_summary else "") + segment
-        await self._graph.aupdate_state(
-            config,
-            {
-                "summary": new_summary,
-                "messages": [RemoveMessage(id=m.id) for m in old if m.id is not None],
-            },
-        )
-
-    def _should_retry(self, exc: Exception, attempt: int) -> bool:
-        """attempt（已执行次数）后判定是否重试：白名单内且未达上限。"""
-        return attempt < self._config.retry_max_attempts and is_retryable(
-            exc, self._config.retryable_exceptions
-        )
-
-    async def _wait_before_retry(self, exc: Exception, attempt: int) -> None:
-        delay = compute_delay(
-            attempt,
-            self._config.retry_base_delay,
-            self._config.retry_backoff_factor,
-        )
-        logging.getLogger(__name__).warning(
-            "graph 调用失败（第 %d 次尝试）：%s: %s；%.1f 秒后重试",
-            attempt,
-            type(exc).__name__,
-            exc,
-            delay,
-        )
-        await asyncio.sleep(delay)
-
-    async def _resume_input(
-        self, thread_id: str, config: RunnableConfig, initial: Any
-    ) -> Any:
-        """重试输入：checkpoint 有 pending 任务 → 先修复 checkpoint 里的消息
-        （本轮中途产生的坏段在入口修复之后才写入，续跑前必须修掉，否则 agent
-        节点会拿到未修复的历史），再 input=None 从 checkpoint 续跑（失败的超步
-        重执行，输入消息不会重复追加）；尚无 checkpoint（首步即失败）→ 复用原输入。"""
-        state = await self._graph.aget_state(config)
-        if state.next or state.values:
-            await self._repair_checkpoint_state(thread_id)
-            return None
-        return initial
+    @property
+    def graph(self) -> CompiledStateGraph[AgentState, AgentContext, AgentState, AgentState]:
+        """暴露编译图：agent 层 checkpoint 修复/压缩/续跑需要 aget_state/aupdate_state。"""
+        return self._graph
 
     async def invoke(
         self,
-        query: str,
+        input: Any,
+        config: RunnableConfig | None = None,
         *,
-        thread_id: str,
-        system: str | None = None,
-        context: AgentContext | None = None,
-    ) -> ConversationResult:
-        """同步语义的一次调用：返回最终文本、本轮消息与工具调用汇总。
+        context: AgentContext | None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """graph.ainvoke 的完全同形透传（input/config/context/其余 kwargs）。
 
-        messages 与 tool_calls 都只含本轮（最后一条 HumanMessage 起）产生的内容，
-        不含该 thread 的历史轮次。context 可覆盖默认的 LLM/工具集（每次 run 注入）。
+        input 为 graph 的初始 state（部分 AgentState dict 亦可，langgraph 运行时补全）。
         """
-        ctx = context or self._context
-        await self._repair_checkpoint_state(thread_id)
-        await self._compress_checkpoint_state(thread_id, ctx)
-        initial = cast(AgentState, self._initial_state(query, system))
-        config = self._run_config(thread_id)
-        attempt = 0
-        while True:
-            attempt += 1
-            graph_input = (
-                initial if attempt == 1 else await self._resume_input(thread_id, config, initial)
-            )
-            try:
-                state = await self._graph.ainvoke(graph_input, config, context=ctx)
-                break
-            except Exception as exc:
-                if not self._should_retry(exc, attempt):
-                    raise
-                await self._wait_before_retry(exc, attempt)
-        round_messages = messages_after_last_human(state["messages"])
-        final_text = ""
-        for message in reversed(round_messages):
-            if isinstance(message, AIMessage) and isinstance(message.content, str) and message.content:
-                final_text = message.content
-                break
-        return ConversationResult(
-            thread_id=thread_id,
-            final_text=final_text,
-            messages=round_messages,
-            tool_calls=collect_tool_calls(round_messages),
-        )
+        _require_context(context)
+        return await self._graph.ainvoke(input, config, context=context, **kwargs)
 
-    async def stream(
+    def stream(
         self,
-        query: str,
+        input: Any,
+        config: RunnableConfig | None = None,
         *,
-        thread_id: str,
-        system: str | None = None,
-        context: AgentContext | None = None,
-    ) -> AsyncIterator[AgentEvent]:
-        """流式执行：依次产出 llm_token / tool_call / tool_result，最后 done 或 error。
+        context: AgentContext | None,
+        **kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        """graph.astream 的完全同形透传（普通函数，直接返回其异步迭代器）。
 
-        基于 graph.astream(stream_mode=["messages", "updates"])：
-        - messages 通道给 token 级文本（只取 agent 节点的 chunk）
-        - updates 通道给完整 AIMessage（tool_call 决策）与 ToolMessage（tool_result）
-        context 可覆盖默认的 LLM/工具集（每次 run 注入，重试续跑沿用同一份）。
+        产出原始 (mode, payload) 元组（stream_mode 为列表时），不做事件分类。
+        注意：不是 async 函数，不要 `await loop.stream(...)`——直接 async for 消费。
         """
-        ctx = context or self._context
-        final_text = ""
-        try:
-            await self._repair_checkpoint_state(thread_id)
-            initial = cast(AgentState, self._initial_state(query, system))
-            config = self._run_config(thread_id)
-            attempt = 0
-            while True:
-                attempt += 1
-                graph_input = (
-                    initial if attempt == 1 else await self._resume_input(thread_id, config, initial)
-                )
-                try:
-                    async for mode, payload in self._graph.astream(
-                        graph_input,
-                        config,
-                        context=ctx,
-                        stream_mode=["messages", "updates"],
-                    ):
-                        if mode == "messages" and isinstance(payload, tuple) and len(payload) == 2:
-                            chunk, metadata = payload
-                            if isinstance(chunk, BaseMessage) and isinstance(metadata, dict):
-                                event = classify_message_chunk(chunk, metadata)
-                                if event:
-                                    yield event
-                        elif mode == "updates" and isinstance(payload, dict):
-                            for node, delta in payload.items():
-                                if node == AGENT_NODE:
-                                    for message in delta.get("messages", []):
-                                        if (
-                                            isinstance(message, AIMessage)
-                                            and isinstance(message.content, str)
-                                            and message.content
-                                            and not message.tool_calls
-                                            and not message.invalid_tool_calls
-                                        ):
-                                            final_text = message.content
-                                for event in classify_node_update(node, delta):
-                                    yield event
-                    break
-                except Exception as exc:
-                    if not self._should_retry(exc, attempt):
-                        raise
-                    await self._wait_before_retry(exc, attempt)
-            state = await self._graph.aget_state(config)
-            # 只汇总本轮（最后一条 HumanMessage 起）的 tool_calls，不含历史轮次
-            round_messages = messages_after_last_human(state.values.get("messages", []))
-            tool_calls = collect_tool_calls(round_messages)
-            yield AgentEvent(
-                EVENT_DONE,
-                {
-                    "thread_id": thread_id,
-                    "final_text": final_text,
-                    "tool_calls": tool_calls,
-                },
-            )
-        except Exception as exc:  # noqa: BLE001 统一转 error 事件，不外泄 traceback
-            yield AgentEvent(EVENT_ERROR, {"message": f"{type(exc).__name__}: {exc}"})
+        _require_context(context)
+        return self._graph.astream(input, config, context=context, **kwargs)
+
+
+def _require_context(context: AgentContext | None) -> None:
+    """context 必传的运行时防线：langgraph 对 None 静默放行（_coerce_context），
+    节点里才会以晦涩的 AttributeError 暴露——这里提前给出明确错误。"""
+    if context is None:
+        raise ValueError(
+            "AgentLoop 不持有默认 LLM/工具：invoke/stream 必须显式传入 context"
+            "（AgentContext(llm=..., tools=...)），由调用方（agent 层）构造注入"
+        )
