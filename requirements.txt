@@ -1,16 +1,21 @@
-# runtime 依赖（Python 3.9 兼容，锁死精确版本）
-langgraph==0.6.11
-langgraph-checkpoint==2.1.2
-langgraph-checkpoint-sqlite==2.0.11
-aiosqlite==0.21.0
-langgraph-prebuilt==0.6.5
-langchain==0.3.30
-langchain-core==0.3.86
-langchain-community==0.3.31
-langchain-experimental==0.3.4
-langchain-openai==0.3.35
-fastapi==0.128.8
-uvicorn==0.39.0
+# runtime 依赖（Python 3.13，锁精确版本）
+langgraph==1.2.11
+langgraph-checkpoint==4.2.0
+langgraph-checkpoint-sqlite==3.1.1
+langgraph-prebuilt==1.1.0
+langchain-core==1.6.2
+langchain-community==0.4.2
+langchain-experimental==0.4.2
+langchain-openai==1.6.0
+openai==3.8.0
+sqlite-vec==0.1.9
+aiosqlite==0.22.1
+ddgs==9.16.0
+wikipedia==1.4.0
+xmltodict==1.0.4
+arxiv==4.0.1
+fastapi==0.141.1
+uvicorn==0.52.4
 httpx==0.28.1
 pydantic==2.13.5
-python-dotenv==1.2.1
+python-dotenv==1.2.3

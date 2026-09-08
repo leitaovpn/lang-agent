@@ -1,11 +1,12 @@
 """内置无副作用演示工具。"""
 import ast
 import operator
-from typing import Union
+from collections.abc import Callable
+from typing import Any
 
 from pydantic import BaseModel, Field
 
-_BIN_OPS = {
+_BIN_OPS: dict[type[ast.operator], Callable[[Any, Any], Any]] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
@@ -14,10 +15,13 @@ _BIN_OPS = {
     ast.Mod: operator.mod,
     ast.Pow: operator.pow,
 }
-_UNARY_OPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+_UNARY_OPS: dict[type[ast.unaryop], Callable[[Any], Any]] = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
 
 
-def _safe_eval(node: ast.AST) -> Union[int, float]:
+def _safe_eval(node: ast.AST) -> int | float:
     if isinstance(node, ast.Expression):
         return _safe_eval(node.body)
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
@@ -41,7 +45,7 @@ def calculator(expression: str) -> str:
         tree = ast.parse(expression, mode="eval")
         result = _safe_eval(tree)
     except (SyntaxError, ValueError, TypeError, ZeroDivisionError) as exc:
-        raise ValueError("无法计算表达式 %r: %s" % (expression, exc))
+        raise ValueError(f"无法计算表达式 {expression!r}: {exc}")
     return str(result)
 
 

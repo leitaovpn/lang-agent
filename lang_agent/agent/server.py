@@ -8,9 +8,13 @@ from collections.abc import AsyncIterator
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
-from lang_agent.ai.errors import MissingApiKeyError, UnknownProviderError, UnknownProtocolError
 from lang_agent.agent.deps import get_loop
 from lang_agent.agent.schemas import ChatRequest, ChatResponse
+from lang_agent.ai.errors import (
+    MissingApiKeyError,
+    UnknownProtocolError,
+    UnknownProviderError,
+)
 from lang_agent.core import AgentLoop
 
 app = FastAPI(title="lang-agent")
@@ -30,15 +34,15 @@ async def build_loop(request: ChatRequest) -> AgentLoop:
         return await get_loop(
             model=request.model, provider=request.provider, protocol=request.protocol
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 统一映射 HTTP 错误，不外泄 traceback
         raise _map_error(exc)
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest, loop: AgentLoop = Depends(build_loop)):
+async def chat(request: ChatRequest, loop: AgentLoop = Depends(build_loop)):  # noqa: B008 FastAPI 依赖注入惯用写法
     try:
         result = await loop.invoke(request.message, thread_id=request.thread_id, system=request.system)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 统一映射 HTTP 错误，不外泄 traceback
         raise _map_error(exc)
     return ChatResponse(
         thread_id=request.thread_id,
@@ -48,7 +52,7 @@ async def chat(request: ChatRequest, loop: AgentLoop = Depends(build_loop)):
 
 
 @app.post("/chat/stream")
-async def chat_stream(request: ChatRequest, loop: AgentLoop = Depends(build_loop)):
+async def chat_stream(request: ChatRequest, loop: AgentLoop = Depends(build_loop)):  # noqa: B008 FastAPI 依赖注入惯用写法
     async def events() -> AsyncIterator[str]:
         async for event in loop.stream(request.message, thread_id=request.thread_id, system=request.system):
             yield event.to_sse()

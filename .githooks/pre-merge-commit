@@ -1,0 +1,4 @@
+#!/bin/sh
+# 本地 merge 生成合并提交前跑全量校验，失败则中止 merge
+# （仅非 fast-forward 合并触发；ff 合并的分支在 push 时已被 pre-push 校验过）
+exec "$(dirname "$0")/_run_checks.sh"

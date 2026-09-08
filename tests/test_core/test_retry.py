@@ -1,6 +1,5 @@
 """重试纯函数测试：白名单判定与指数退避。"""
 import httpx
-import pytest
 
 from lang_agent.core.retry import (
     DEFAULT_RETRYABLE_EXCEPTIONS,

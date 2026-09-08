@@ -1,28 +1,27 @@
 """provider/protocol 注册表：把 (model, provider, protocol) 映射为 LLM 调用对象。"""
 import os
-from typing import Dict, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from lang_agent.ai.base import LLMFactory, ProviderConfig
 from lang_agent.ai.errors import (
     MissingApiKeyError,
-    UnknownProviderError,
     UnknownProtocolError,
+    UnknownProviderError,
 )
 
 
 class ProviderRegistry:
     """按 provider + protocol 两级分发 LLM 构建工厂。"""
 
-    def __init__(self):
-        self._factories: Dict[str, Dict[str, LLMFactory]] = {}
-        self._configs: Dict[str, ProviderConfig] = {}
+    def __init__(self) -> None:
+        self._factories: dict[str, dict[str, LLMFactory]] = {}
+        self._configs: dict[str, ProviderConfig] = {}
 
     def register(
         self,
         provider: str,
-        protocols: Dict[str, LLMFactory],
+        protocols: dict[str, LLMFactory],
         config: ProviderConfig,
     ) -> None:
         """注册一个 provider 及其支持的 protocol 集合。"""
@@ -35,7 +34,7 @@ class ProviderRegistry:
         model: str,
         provider: str = "deepseek",
         protocol: str = "chat_response",
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
     ) -> BaseChatModel:
         """根据 (model, provider, protocol) 返回 LLM 调用对象。
 
@@ -46,27 +45,26 @@ class ProviderRegistry:
         config = self._configs.get(provider)
         if config is None:
             raise UnknownProviderError(
-                "未知 provider: %r，已注册: %s" % (provider, sorted(self._factories))
+                f"未知 provider: {provider!r}，已注册: {sorted(self._factories)}"
             )
 
         factory = self._factories[provider].get(protocol)
         if factory is None:
             raise UnknownProtocolError(
-                "provider %r 不支持 protocol %r，支持: %s"
-                % (provider, protocol, sorted(self._factories[provider]))
+                f"provider {provider!r} 不支持 protocol {protocol!r}，"
+                f"支持: {sorted(self._factories[provider])}"
             )
 
         if api_key is None:
-            api_key = os.environ.get(config.api_key_env)
+            api_key = os.getenv(config.api_key_env)
         if not api_key:
             raise MissingApiKeyError(
-                "缺少 API key：请设置环境变量 %s 或显式传入 api_key 参数"
-                % config.api_key_env
+                f"缺少 API key：请设置环境变量 {config.api_key_env} 或显式传入 api_key 参数"
             )
 
         base_url = config.base_url
         if config.base_url_env:
-            base_url = os.environ.get(config.base_url_env, base_url)
+            base_url = os.getenv(config.base_url_env, base_url)
 
         return factory(model=model, api_key=api_key, base_url=base_url)
 
@@ -80,7 +78,7 @@ def get_llm(
     model: str,
     provider: str = "deepseek",
     protocol: str = "chat_response",
-    api_key: Optional[str] = None,
+    api_key: str | None = None,
 ) -> BaseChatModel:
     """便捷工厂。示例：
 

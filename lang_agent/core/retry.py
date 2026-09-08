@@ -20,7 +20,10 @@ DEFAULT_RETRYABLE_EXCEPTIONS = (
 )
 
 
-def is_retryable(exc: BaseException, retryable_exceptions=None) -> bool:
+def is_retryable(
+    exc: BaseException,
+    retryable_exceptions: tuple[type[BaseException], ...] | None = None,
+) -> bool:
     """白名单判定；retryable_exceptions 为 None 时用默认白名单。"""
     exceptions = retryable_exceptions if retryable_exceptions is not None else DEFAULT_RETRYABLE_EXCEPTIONS
     return isinstance(exc, exceptions)

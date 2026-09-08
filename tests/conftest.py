@@ -1,11 +1,13 @@
 """共享测试设施：可编程 FakeChatModel。"""
 import json
-from typing import Any, Iterator, List, Optional
+from collections.abc import Callable, Iterator, Sequence
+from typing import Any, cast, override
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.tools import BaseTool
 from pydantic import Field
 
 
@@ -19,24 +21,33 @@ class FakeChatModel(BaseChatModel):
     供测试断言「第 N 轮 LLM 看到了什么」。
     """
 
-    responses: List[AIMessage] = Field(default_factory=list)
-    seen_messages: List[List[BaseMessage]] = Field(default_factory=list)
-    bound_tools: List[Any] = Field(default_factory=list)
+    responses: list[AIMessage] = Field(default_factory=list)
+    seen_messages: list[list[BaseMessage]] = Field(default_factory=list)
+    bound_tools: list[Any] = Field(default_factory=list)
 
     @property
+    @override
     def _llm_type(self) -> str:
         return "fake-chat"
 
-    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+    @override
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
+        *,
+        tool_choice: Any = None,
+        **kwargs: Any,
+    ):
         """记录被绑定的工具，并像真实模型一样返回 RunnableBinding（BaseChatModel.bind_tools 是抽象方法）。"""
         self.bound_tools.extend(tools)
         return self.bind(tools=list(tools))
 
+    @override
     def _generate(
         self,
-        messages: List[BaseMessage],
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
         self.seen_messages.append(list(messages))
@@ -44,14 +55,18 @@ class FakeChatModel(BaseChatModel):
             raise AssertionError("FakeChatModel responses 脚本耗尽")
         return ChatResult(generations=[ChatGeneration(message=self.responses.pop(0))])
 
+    @override
     def _stream(
         self,
-        messages: List[BaseMessage],
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        message = self._generate(messages, stop=stop, run_manager=run_manager, **kwargs).generations[0].message
+        message = cast(
+            AIMessage,
+            self._generate(messages, stop=stop, run_manager=run_manager, **kwargs).generations[0].message,
+        )
         if isinstance(message.content, str):
             for token in message.content:
                 yield ChatGenerationChunk(message=AIMessageChunk(content=token))
@@ -85,12 +100,19 @@ class FlakyChatModel(FakeChatModel):
     """
 
     fail_times: int = 1
-    fail_at: Optional[int] = None  # 指定第 N 次（1 起）调用失败，用于「中途失败」场景
+    fail_at: int | None = None  # 指定第 N 次（1 起）调用失败，用于「中途失败」场景
     error: Any = None
     error_factory: Any = None
     calls: int = 0
 
-    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+    @override
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
         self.calls += 1
         should_fail = self.calls <= self.fail_times or self.calls == self.fail_at
         if should_fail:

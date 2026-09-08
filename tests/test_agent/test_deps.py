@@ -1,8 +1,8 @@
 """agent 层装配（deps/config）测试。"""
 from lang_agent.agent import config as app_config
 from lang_agent.agent.deps import get_loop
-from lang_agent.core import AgentLoop, AgentLoopConfig
 from lang_agent.ai.errors import UnknownProviderError
+from lang_agent.core import AgentLoop, AgentLoopConfig
 
 
 def test_config_defaults():
@@ -17,7 +17,12 @@ def test_loop_config_kind():
 
 
 def test_loop_config_injects_openai_transient_exceptions():
-    from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+    from openai import (
+        APIConnectionError,
+        APITimeoutError,
+        InternalServerError,
+        RateLimitError,
+    )
 
     cfg = app_config.loop_config()
     injected = set(cfg.retryable_exceptions or ())

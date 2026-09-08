@@ -1,5 +1,5 @@
 """agent 层请求/响应模型。"""
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -10,10 +10,10 @@ class ChatRequest(BaseModel):
     protocol: str = Field(default="chat_response")
     thread_id: str = Field(default="default")
     message: str
-    system: Optional[str] = None
+    system: str | None = None
 
 
 class ChatResponse(BaseModel):
     thread_id: str
     answer: str
-    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)

@@ -25,7 +25,7 @@ def test_state_repair_fixes_segment_before_trailing_text_ai():
         AIMessage(content="分别是 2 和 4"),
     ]
     repaired = repair_state_for_checkpoint(messages)
-    calling_ai = [m for m in repaired if isinstance(m, AIMessage) and m.tool_calls][0]
+    calling_ai = next(m for m in repaired if isinstance(m, AIMessage) and m.tool_calls)
     ids = [c["id"] for c in calling_ai.tool_calls]
     assert len(ids) == len(set(ids)) == 2
     tool_ids = [m.tool_call_id for m in repaired if isinstance(m, ToolMessage)]

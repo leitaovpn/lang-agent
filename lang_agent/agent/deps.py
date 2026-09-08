@@ -1,20 +1,18 @@
 """agent 层装配：把 ai 层 + core 层组合成可用的 AgentLoop（按参数缓存单例）。"""
-from typing import Optional
-
-from lang_agent.ai import get_llm
 from lang_agent.agent import config as app_config
+from lang_agent.ai import get_llm
 from lang_agent.core import AgentLoop, AgentLoopConfig, build_checkpointer
 
 # (model, provider, protocol, checkpointer_kind, db_path) → AgentLoop 单例
-_loops = {}
+_loops: dict[tuple[str, str, str, str, str], AgentLoop] = {}
 
 
 async def get_loop(
     *,
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
-    protocol: Optional[str] = None,
-    config: Optional[AgentLoopConfig] = None,
+    model: str | None = None,
+    provider: str | None = None,
+    protocol: str | None = None,
+    config: AgentLoopConfig | None = None,
 ) -> AgentLoop:
     """按参数装配 AgentLoop；相同参数返回同一个实例（同一 checkpointer 连接）。
 
