@@ -8,9 +8,9 @@ from collections.abc import AsyncIterator
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
-from lang_agent.ai.errors import MissingApiKeyError, UnknownProviderError, UnknownProtocolError
 from lang_agent.agent.deps import get_loop
 from lang_agent.agent.schemas import ChatRequest, ChatResponse
+from lang_agent.ai.errors import MissingApiKeyError, UnknownProviderError, UnknownProtocolError
 from lang_agent.core import AgentLoop
 
 app = FastAPI(title="lang-agent")

@@ -1,6 +1,6 @@
 """agent 层装配：把 ai 层 + core 层组合成可用的 AgentLoop（按参数缓存单例）。"""
-from lang_agent.ai import get_llm
 from lang_agent.agent import config as app_config
+from lang_agent.ai import get_llm
 from lang_agent.core import AgentLoop, AgentLoopConfig, build_checkpointer
 
 # (model, provider, protocol, checkpointer_kind, db_path) → AgentLoop 单例
