@@ -20,7 +20,7 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Annotated, Any, Optional, TypedDict, cast
+from typing import Annotated, Any, TypedDict, cast
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
@@ -102,7 +102,7 @@ class AgentContext(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     llm: BaseChatModel
     tools: list[BaseTool]
-    summarizer_llm: Optional[BaseChatModel] = None  # context 压缩的摘要模型，缺省复用 llm
+    summarizer_llm: BaseChatModel | None = None  # context 压缩的摘要模型，缺省复用 llm
 
 
 @dataclass
@@ -114,7 +114,7 @@ class AgentLoopConfig:
     retry_max_attempts: int = 3  # 总尝试次数（含首次）
     retry_base_delay: float = 0.5  # 首次退避秒数
     retry_backoff_factor: float = 2.0  # 指数退避因子
-    retryable_exceptions: Optional[tuple] = None  # None → 默认白名单（见 core/retry.py）
+    retryable_exceptions: tuple[type[BaseException], ...] | None = None  # None → 默认白名单（见 core/retry.py）
     # context 压缩（摘要 + 保留窗口 + 工具输出截断，见 core/compress.py）
     compress_enabled: bool = True
     compress_token_threshold: int = 8000  # 估算 token 超此阈值触发压缩
@@ -155,8 +155,8 @@ class AgentLoop:
     def __init__(
         self,
         llm: BaseChatModel,
-        tools: Optional[list[BaseTool]] = None,
-        config: Optional[AgentLoopConfig] = None,
+        tools: list[BaseTool] | None = None,
+        config: AgentLoopConfig | None = None,
         checkpointer=None,
     ):
         self._llm = llm
@@ -176,7 +176,7 @@ class AgentLoop:
         self._context = AgentContext(llm=self._llm, tools=self._tools)
         self._graph = self._build_graph()
 
-    def _build_tools(self, tools:  Optional[list[BaseTool]] = None) -> list[BaseTool]:
+    def _build_tools(self, tools: list[BaseTool] | None = None) -> list[BaseTool]:
         """按配置构建工具列表（可被子类覆盖）。"""
         default_tools = instantiate_tools()
         return default_tools + (tools or [])
@@ -251,7 +251,7 @@ class AgentLoop:
             "recursion_limit": self._config.recursion_limit,
         }
 
-    def _initial_state(self, query: str, system: Optional[str]) -> dict[str, Any]:
+    def _initial_state(self, query: str, system: str | None) -> dict[str, Any]:
         # system 仅在显式提供时写入：不提供则保留该 thread 既有的 system（checkpoint 恢复）
         initial: dict[str, Any] = {
             "messages": [HumanMessage(content=query)],
@@ -373,8 +373,8 @@ class AgentLoop:
         query: str,
         *,
         thread_id: str,
-        system: Optional[str] = None,
-        context: Optional[AgentContext] = None,
+        system: str | None = None,
+        context: AgentContext | None = None,
     ) -> ConversationResult:
         """同步语义的一次调用：返回最终文本、本轮消息与工具调用汇总。
 
@@ -417,8 +417,8 @@ class AgentLoop:
         query: str,
         *,
         thread_id: str,
-        system: Optional[str] = None,
-        context: Optional[AgentContext] = None,
+        system: str | None = None,
+        context: AgentContext | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """流式执行：依次产出 llm_token / tool_call / tool_result，最后 done 或 error。
 
