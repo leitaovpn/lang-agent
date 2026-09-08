@@ -3,12 +3,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from langchain_community.agent_toolkits.file_management import FileManagementToolkit
+from langchain_community.agent_toolkits.load_tools import load_tools
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel
 
 from lang_agent.core import tools as builtin_tools
-from langchain_community.agent_toolkits.file_management import FileManagementToolkit
-from langchain_community.agent_toolkits.load_tools import load_tools
 
 
 @dataclass(slots=True)
