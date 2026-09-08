@@ -14,7 +14,7 @@ from lang_agent.ai.errors import (
 class ProviderRegistry:
     """按 provider + protocol 两级分发 LLM 构建工厂。"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._factories: dict[str, dict[str, LLMFactory]] = {}
         self._configs: dict[str, ProviderConfig] = {}
 
