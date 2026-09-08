@@ -68,34 +68,36 @@ def _chat_stream(base_url: str, payload: dict[str, str]) -> int:
     """SSE 流式打印：llm_token 实时输出，tool 过程灰显，error 走 stderr 退出码 1。"""
     saw_token = False
     try:
-        with httpx.Client(base_url=base_url, timeout=None) as client:
-            with client.stream("POST", "/chat/stream", json=payload) as resp:
-                if resp.status_code != 200:
-                    return _print_error(resp.read().decode("utf-8", errors="replace"))
-                event_type = ""
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    if line.startswith("event:"):
-                        event_type = line.split(":", 1)[1].strip()
-                    elif line.startswith("data:"):
-                        data = json.loads(line.split(":", 1)[1].strip())
-                        if event_type == "llm_token":
-                            saw_token = True
-                            print(data["text"], end="", flush=True)
-                        elif event_type == "tool_call":
-                            print(f"\n⚙ {data['name']}({json.dumps(data['arguments'], ensure_ascii=False)})")
-                        elif event_type == "tool_result":
-                            print(f"  → {data['content']}")
-                        elif event_type == "done":
-                            if not saw_token:
-                                print(data["final_text"])
-                            else:
-                                print()
-                            return 0
-                        elif event_type == "error":
-                            print(f"\n❌ {data['message']}", file=sys.stderr)
-                            return 1
+        with (
+            httpx.Client(base_url=base_url, timeout=None) as client,
+            client.stream("POST", "/chat/stream", json=payload) as resp,
+        ):
+            if resp.status_code != 200:
+                return _print_error(resp.read().decode("utf-8", errors="replace"))
+            event_type = ""
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                if line.startswith("event:"):
+                    event_type = line.split(":", 1)[1].strip()
+                elif line.startswith("data:"):
+                    data = json.loads(line.split(":", 1)[1].strip())
+                    if event_type == "llm_token":
+                        saw_token = True
+                        print(data["text"], end="", flush=True)
+                    elif event_type == "tool_call":
+                        print(f"\n⚙ {data['name']}({json.dumps(data['arguments'], ensure_ascii=False)})")
+                    elif event_type == "tool_result":
+                        print(f"  → {data['content']}")
+                    elif event_type == "done":
+                        if not saw_token:
+                            print(data["final_text"])
+                        else:
+                            print()
+                        return 0
+                    elif event_type == "error":
+                        print(f"\n❌ {data['message']}", file=sys.stderr)
+                        return 1
     except httpx.HTTPError as exc:
         print(f"❌ 无法连接 {base_url}: {exc}", file=sys.stderr)
         return 1
