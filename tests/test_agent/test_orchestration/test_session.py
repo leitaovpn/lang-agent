@@ -7,7 +7,12 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from lang_agent.agent.orchestration import ChatSession
-from lang_agent.core.loop import AgentContext, AgentLoop, AgentLoopConfig
+from lang_agent.core.loop import (
+    AgentContext,
+    AgentLoop,
+    AgentLoopConfig,
+    require_human_approval,
+)
 from lang_agent.core.loop.retry import RetryableError
 from lang_agent.core.tool import instantiate_tools
 from tests.conftest import FakeChatModel, FlakyChatModel
@@ -73,6 +78,76 @@ async def test_invoke_with_tool_round_executes_real_tool():
     assert [tc["name"] for tc in result.tool_calls] == ["calculator"]
     tool_messages = [m for m in result.messages if isinstance(m, ToolMessage)]
     assert tool_messages and tool_messages[0].content == "56"
+
+
+async def test_invoke_pauses_for_approval_then_resume_completes():
+    cfg = AgentLoopConfig(tool_approval_hook=require_human_approval)
+    session, _, ctx = make_session(
+        [AIMessage(content="", tool_calls=[TOOL_CALL]), AIMessage(content="结果是 56")],
+        config=cfg,
+        checkpointer=InMemorySaver(),
+    )
+    paused = await session.invoke("计算", thread_id="approval", context=ctx)
+    assert paused.status == "awaiting_approval"
+    assert paused.approval is not None
+    assert paused.approval["tool_calls"][0]["name"] == "calculator"
+
+    completed = await session.resume(
+        {
+            "approval_id": paused.approval["approval_id"],
+            "decisions": [{"tool_call_id": "call_1", "action": "approve"}],
+        },
+        thread_id="approval",
+        context=ctx,
+    )
+    assert completed.status == "completed"
+    assert completed.final_text == "结果是 56"
+
+
+async def test_stream_emits_approval_required_without_done_then_resumes():
+    cfg = AgentLoopConfig(tool_approval_hook=require_human_approval)
+    session, _, ctx = make_session(
+        [AIMessage(content="", tool_calls=[TOOL_CALL]), AIMessage(content="结果是 56")],
+        config=cfg,
+        checkpointer=InMemorySaver(),
+    )
+    paused = [
+        event async for event in session.stream("计算", thread_id="approval-stream", context=ctx)
+    ]
+    assert paused[-1].type == "approval_required"
+    assert all(event.type != "done" for event in paused)
+
+    resumed = [
+        event
+        async for event in session.resume_stream(
+            {
+                "approval_id": paused[-1].data["approval_id"],
+                "decisions": [{"tool_call_id": "call_1", "action": "approve"}],
+            },
+            thread_id="approval-stream",
+            context=ctx,
+        )
+    ]
+    assert resumed[-1].type == "done"
+    assert resumed[-1].data["final_text"] == "结果是 56"
+
+
+async def test_invalid_resume_decision_keeps_approval_pending():
+    cfg = AgentLoopConfig(tool_approval_hook=require_human_approval)
+    session, _, ctx = make_session(
+        [AIMessage(content="", tool_calls=[TOOL_CALL]), AIMessage(content="结果是 56")],
+        config=cfg,
+        checkpointer=InMemorySaver(),
+    )
+    paused = await session.invoke("计算", thread_id="retry-approval", context=ctx)
+    assert paused.approval is not None
+    with pytest.raises(ValueError, match="完整覆盖"):
+        await session.resume(
+            {"approval_id": paused.approval["approval_id"], "decisions": []},
+            thread_id="retry-approval",
+            context=ctx,
+        )
+    assert await session.get_pending_approval("retry-approval") is not None
 
 
 async def test_tool_calls_only_summarize_current_round():

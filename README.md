@@ -54,10 +54,13 @@ CLI 调用（纯 HTTP 客户端，走本地 API）：
 
 # 交互模式（默认流式、多轮上下文连续；无服务端时自动拉起，端口被占自动换端口）
 .venv/bin/python -m lang_agent.agent.cli chat
+
+# 重新处理某线程尚未提交的工具审批
+.venv/bin/python -m lang_agent.agent.cli chat --resume --thread-id my-thread
 ```
 
 交互模式内支持 `/help`、`/exit`、`/quit`；Ctrl+C 中断当前生成或退出。
-工具结果默认截断到 500 字符再打印（`--max-output-chars` 可覆盖，`<=0` 不截断）；`--thread-id` 可续指定会话。
+所有工具调用默认先显示名称与参数并逐条询问 `允许执行？[y/N]`，回车表示拒绝；审批提交前工具不会执行。工具结果默认截断到 500 字符再打印（`--max-output-chars` 可覆盖，`<=0` 不截断）；`--thread-id` 可续指定会话。
 
 直接调 API：
 
@@ -90,7 +93,20 @@ curl -N -X POST http://127.0.0.1:8000/chat/stream \
 }
 ```
 
-响应 `ChatResponse`：`{"thread_id": "...", "answer": "...", "tool_calls": [...]}`
+响应 `ChatResponse`。正常完成时 `status` 为 `completed`；等待审批时为 `awaiting_approval`，并通过 `approval.tool_calls` 返回待审批调用：
+
+```json
+{
+  "thread_id": "t1",
+  "answer": "",
+  "tool_calls": [{"id": "call_1", "name": "calculator", "arguments": {"expression": "1+1"}}],
+  "status": "awaiting_approval",
+  "approval": {
+    "approval_id": "approval_...",
+    "tool_calls": [{"id": "call_1", "name": "calculator", "arguments": {"expression": "1+1"}}]
+  }
+}
+```
 
 错误语义：未知 provider / protocol → `400`；缺 API key → `500`（附环境变量名）。
 
@@ -103,9 +119,26 @@ curl -N -X POST http://127.0.0.1:8000/chat/stream \
 | `thinking_token` | `{"text": "..."}` | 模型逐 token 思考（reasoning_content） |
 | `llm_token` | `{"text": "..."}` | agent 逐 token 文本 |
 | `tool_call` | `{"id", "name", "arguments"}` | 模型发起工具调用 |
+| `approval_required` | `{"approval_id", "tool_calls"}` | graph 已暂停，等待人工审批；本次 SSE 随后结束 |
 | `tool_result` | `{"tool_call_id", "name", "content"}` | 工具执行结果 |
 | `done` | `{"thread_id", "final_text", "tool_calls"}` | 循环正常结束 |
 | `error` | `{"message"}` | 循环异常终止 |
+
+### 工具审批与恢复
+
+把 `POST /chat` 返回的 `approval_id` 和每条调用的决定提交到 `POST /chat/resume`；流式客户端使用 `POST /chat/resume/stream`。决定必须完整覆盖当前批次，动作只能是 `approve` 或 `reject`：
+
+```json
+{
+  "thread_id": "t1",
+  "approval_id": "approval_...",
+  "decisions": [
+    {"tool_call_id": "call_1", "action": "approve"}
+  ]
+}
+```
+
+`GET /chat/approval?thread_id=t1` 可查询尚未处理的批次。新消息遇到待审批线程返回 `409`；不存在的审批返回 `404`；过期或不完整的决定返回 `400`。拒绝的工具不会执行，graph 会生成错误 `ToolMessage` 供模型继续回答。
 
 ## 配置
 
@@ -158,16 +191,23 @@ registry.register(
 ```
 START → agent（LLM + bind_tools，流式合并）→ should_continue
           ├─ 无 tool_calls → END
-          └─ 有 tool_calls → tools（ToolNode 执行真实工具）→ agent（回环）
+          └─ 有 tool_calls → approval（可中断恢复）→ tools（仅执行获批工具）→ agent（回环）
 ```
 
 `AgentLoop` 是纯 graph 薄封装：构造只编译 graph，invoke/stream 与 `graph.ainvoke/astream` 同形透传，不持有 LLM/工具——每次 run 经 `context=` 注入：
 
 ```python
 from lang_agent.ai import get_llm
-from lang_agent.core.loop import AgentContext, AgentLoop, AgentLoopConfig
+from lang_agent.core.loop import (
+    AgentContext,
+    AgentLoop,
+    AgentLoopConfig,
+    require_human_approval,
+)
 
-loop = AgentLoop(config=AgentLoopConfig())   # checkpointer 默认 memory
+loop = AgentLoop(
+    config=AgentLoopConfig(tool_approval_hook=require_human_approval)
+)  # checkpointer 默认 memory；钩子通过 config 注入
 context = AgentContext(llm=get_llm(model="deepseek-v4-flash"), tools=[])
 
 cfg = {"configurable": {"thread_id": "t1"}}
@@ -199,7 +239,7 @@ register_tool(ToolSpec(name="weather", description="查询天气", fn=weather, a
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest        # 128 个测试，全部用 FakeChatModel 注入，不依赖真实 API key
+.venv/bin/python -m pytest        # 全部使用 FakeChatModel 注入，不依赖真实 API key
 ```
 
 ## 已知注意点

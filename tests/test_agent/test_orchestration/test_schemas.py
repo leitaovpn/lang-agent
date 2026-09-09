@@ -2,7 +2,11 @@
 import pytest
 from pydantic import ValidationError
 
-from lang_agent.agent.orchestration.schemas import ChatRequest, ChatResponse
+from lang_agent.agent.orchestration.schemas import (
+    ChatRequest,
+    ChatResponse,
+    ChatResumeRequest,
+)
 
 
 def test_chat_request_defaults():
@@ -40,3 +44,12 @@ def test_chat_request_requires_message():
 def test_chat_response_default_tool_calls():
     resp = ChatResponse(thread_id="t1", answer="好")
     assert resp.tool_calls == []
+
+
+def test_chat_resume_request_parses_decisions():
+    request = ChatResumeRequest(
+        thread_id="t1",
+        approval_id="approval_1",
+        decisions=[{"tool_call_id": "c1", "action": "approve"}],
+    )
+    assert request.decisions[0].action == "approve"

@@ -2,7 +2,7 @@
 from lang_agent.agent.orchestration import config as app_config
 from lang_agent.agent.orchestration.deps import ChatDeps, get_deps
 from lang_agent.ai.errors import UnknownProviderError
-from lang_agent.core.loop import AgentLoopConfig
+from lang_agent.core.loop import AgentLoopConfig, require_human_approval
 
 
 def test_config_defaults():
@@ -14,6 +14,7 @@ def test_config_defaults():
 def test_loop_config_kind():
     cfg = app_config.loop_config()
     assert isinstance(cfg, AgentLoopConfig)
+    assert cfg.tool_approval_hook is require_human_approval
 
 
 def test_loop_config_injects_openai_transient_exceptions():

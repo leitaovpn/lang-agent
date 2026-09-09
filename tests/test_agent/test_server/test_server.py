@@ -6,8 +6,13 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from lang_agent.agent.orchestration import ChatSession
 from lang_agent.agent.orchestration.deps import ChatDeps
-from lang_agent.agent.server.app import app, build_deps
-from lang_agent.core.loop import AgentContext, AgentLoop, AgentLoopConfig
+from lang_agent.agent.server.app import app, build_deps, build_resume_deps
+from lang_agent.core.loop import (
+    AgentContext,
+    AgentLoop,
+    AgentLoopConfig,
+    require_human_approval,
+)
 from lang_agent.core.tool import instantiate_tools
 from tests.conftest import FakeChatModel
 
@@ -107,3 +112,40 @@ async def test_stream_endpoint_sse(client, override_deps):
     assert "event: tool_result" in body
     assert "event: done" in body
     assert "结果是 56" in body
+
+
+async def test_chat_approval_and_resume_endpoints(client):
+    config = AgentLoopConfig(tool_approval_hook=require_human_approval)
+    llm = FakeChatModel(
+        responses=[AIMessage(content="", tool_calls=[TOOL_CALL]), AIMessage(content="结果是 56")]
+    )
+    deps = ChatDeps(
+        session=ChatSession(
+            loop=AgentLoop(config=config, checkpointer=InMemorySaver()), config=config
+        ),
+        context=AgentContext(llm=llm, tools=instantiate_tools()),
+    )
+
+    async def factory(request=None):
+        return deps
+
+    app.dependency_overrides[build_deps] = factory
+    app.dependency_overrides[build_resume_deps] = factory
+    try:
+        paused = await client.post("/chat", json={"message": "计算", "thread_id": "approval"})
+        assert paused.status_code == 200
+        body = paused.json()
+        assert body["status"] == "awaiting_approval"
+        resumed = await client.post(
+            "/chat/resume",
+            json={
+                "thread_id": "approval",
+                "approval_id": body["approval"]["approval_id"],
+                "decisions": [{"tool_call_id": "call_1", "action": "approve"}],
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "completed"
+    assert resumed.json()["answer"] == "结果是 56"

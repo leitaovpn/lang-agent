@@ -23,7 +23,7 @@ class ChatDeps:
 
 
 # (model, provider, protocol, checkpointer_kind, db_path) → ChatDeps 单例
-_deps: dict[tuple[str, str, str, str, str], ChatDeps] = {}
+_deps: dict[tuple[str, str, str, str, str, int], ChatDeps] = {}
 
 
 async def get_deps(
@@ -43,7 +43,14 @@ async def get_deps(
     protocol = protocol or app_config.DEFAULT_PROTOCOL
     cfg = config or app_config.loop_config()
 
-    key = (model, provider, protocol, cfg.checkpointer_kind, cfg.db_path)
+    key = (
+        model,
+        provider,
+        protocol,
+        cfg.checkpointer_kind,
+        cfg.db_path,
+        id(cfg.tool_approval_hook),
+    )
     if key not in _deps:
         llm = get_llm(model=model, provider=provider, protocol=protocol)
         checkpointer = await build_checkpointer(cfg)

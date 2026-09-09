@@ -4,6 +4,7 @@
     python -m lang_agent.agent.cli serve [--host 127.0.0.1] [--port 8000]
     python -m lang_agent.agent.cli chat --msg "计算 (3+5)*7" [--stream] [--model ...] [--thread-id ...]
     python -m lang_agent.agent.cli chat                              # 交互模式（默认流式，多轮，自动拉起服务）
+    python -m lang_agent.agent.cli chat --resume --thread-id t1     # 恢复待审批工具调用
 
 工具结果打印默认截断到 500 字符（--max-output-chars 可覆盖，≤0 不截断）。
 """
@@ -37,9 +38,9 @@ def _build_payload(
     provider: str | None,
     protocol: str | None,
     thread_id: str | None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """组装 /chat 请求体：None 的字段不传，走服务端默认值。"""
-    payload: dict[str, str] = {"message": message}
+    payload: dict[str, Any] = {"message": message}
     if model:
         payload["model"] = model
     if provider:
@@ -61,6 +62,38 @@ def _truncate(content: str, max_chars: int) -> str:
     if max_chars <= 0 or len(content) <= max_chars:
         return content
     return f"{content[:max_chars]}…（共 {len(content)} 字，已截断）"
+
+
+def _prompt_approval(approval: dict[str, Any]) -> dict[str, Any] | None:
+    """展示一批工具调用并逐条收集决定；EOF/Ctrl+C 保留待审批状态。"""
+    print("\n工具执行需要审批")
+    decisions: list[dict[str, str]] = []
+    try:
+        for call in approval.get("tool_calls", []):
+            print(f"\n{call.get('name')}")
+            print(f"参数：{json.dumps(call.get('arguments', {}), ensure_ascii=False)}")
+            answer = input("允许执行？[y/N]: ").strip().lower()
+            action = "approve" if answer in ("y", "yes") else "reject"
+            item = {"tool_call_id": call["id"], "action": action}
+            if action == "reject":
+                item["reason"] = "用户拒绝执行"
+            decisions.append(item)
+    except (EOFError, KeyboardInterrupt):
+        print("\n审批未提交，可使用 --resume --thread-id 继续")
+        return None
+    return {"approval_id": approval["approval_id"], "decisions": decisions}
+
+
+def _build_resume_payload(
+    approval: dict[str, Any], source: dict[str, Any]
+) -> dict[str, Any] | None:
+    decision = _prompt_approval(approval)
+    if decision is None:
+        return None
+    for field in ("model", "provider", "protocol", "thread_id"):
+        if source.get(field):
+            decision[field] = source[field]
+    return decision
 
 
 def _http_ok(base_url: str, timeout: float = 1.0) -> bool:
@@ -127,6 +160,8 @@ def _ensure_server(
 
 
 def _chat(args) -> int:
+    if args.resume:
+        return _resume_pending(args)
     if args.message is None:
         return _interactive(args)
     payload = _build_payload(
@@ -147,13 +182,32 @@ def _chat(args) -> int:
     if resp.status_code != 200:
         return _print_error(resp.text)
     data = resp.json()
+    while data.get("status") == "awaiting_approval":
+        resume_payload = _build_resume_payload(data["approval"], payload)
+        if resume_payload is None:
+            return 2
+        try:
+            with httpx.Client(base_url=args.base_url, timeout=120) as client:
+                resp = client.post("/chat/resume", json=resume_payload)
+        except httpx.HTTPError as exc:
+            print(f"❌ 无法连接 {args.base_url}: {exc}", file=sys.stderr)
+            return 1
+        if resp.status_code != 200:
+            return _print_error(resp.text)
+        data = resp.json()
     for tool_call in data.get("tool_calls", []):
         print(f"⚙ {tool_call.get('name')}({json.dumps(tool_call.get('arguments'), ensure_ascii=False)})")
     print(data["answer"])
     return 0
 
 
-def _chat_stream(base_url: str, payload: dict[str, str], *, max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS) -> int:
+def _chat_stream(
+    base_url: str,
+    payload: dict[str, Any],
+    *,
+    max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
+    endpoint: str = "/chat/stream",
+) -> int:
     """SSE 流式打印：Thinking/Answer 打字机 + 工具块（同一 tool_call_id 的 Input/Output 配对）。
 
     标题按段打印：thinking 段 → “Thinking...” 标题；工具轮之后新一轮 content
@@ -163,67 +217,111 @@ def _chat_stream(base_url: str, payload: dict[str, str], *, max_output_chars: in
     saw_any = False  # 是否已输出任何内容（done 时决定是否补 final_text）
     # 工具配对：tool_call → 缓存，同 id 的 tool_result 到达时一起打印
     pending_tools: dict[str, dict[str, Any]] = {}
-    try:
-        with (
-            httpx.Client(base_url=base_url, timeout=None) as client,
-            client.stream("POST", "/chat/stream", json=payload) as resp,
-        ):
-            if resp.status_code != 200:
-                return _print_error(resp.read().decode("utf-8", errors="replace"))
-            event_type = ""
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                if line.startswith("event:"):
-                    event_type = line.split(":", 1)[1].strip()
-                elif line.startswith("data:"):
-                    data = json.loads(line.split(":", 1)[1].strip())
-                    if event_type == "thinking_token":
-                        if current == "answer" or current is None:
-                            # 段首（含工具轮后新一轮思考）打标题；与前段分隔
+    request_payload = payload
+    request_endpoint = endpoint
+    while True:
+        approval: dict[str, Any] | None = None
+        try:
+            with (
+                httpx.Client(base_url=base_url, timeout=None) as client,
+                client.stream("POST", request_endpoint, json=request_payload) as resp,
+            ):
+                if resp.status_code != 200:
+                    return _print_error(resp.read().decode("utf-8", errors="replace"))
+                event_type = ""
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("event:"):
+                        event_type = line.split(":", 1)[1].strip()
+                    elif line.startswith("data:"):
+                        data = json.loads(line.split(":", 1)[1].strip())
+                        if event_type == "thinking_token":
+                            if current == "answer" or current is None:
+                                if saw_any:
+                                    print()
+                                print("Thinking...")
+                            current = "thinking"
+                            saw_any = True
+                            print(data["text"], end="", flush=True)
+                        elif event_type == "llm_token":
+                            if current != "answer":
+                                if current == "thinking" or saw_any:
+                                    print()
+                                print("Answer...")
+                            current = "answer"
+                            saw_any = True
+                            print(data["text"], end="", flush=True)
+                        elif event_type == "tool_call":
+                            pending_tools[data["id"]] = data
+                        elif event_type == "tool_result":
+                            call = pending_tools.pop(data["tool_call_id"], None)
+                            name = call["name"] if call else data.get("name")
+                            args = call["arguments"] if call else None
                             if saw_any:
                                 print()
-                            print("Thinking...")
-                        current = "thinking"
-                        saw_any = True
-                        print(data["text"], end="", flush=True)
-                    elif event_type == "llm_token":
-                        if current != "answer":
-                            # thinking 段结束后紧接 answer；若从思考段切换，标题紧跟输出
-                            if current == "thinking" or saw_any:
+                            print(f"{name}...")
+                            if args is not None:
+                                print(f"Input: {json.dumps(args, ensure_ascii=False)}")
+                            print("Output:")
+                            print(_truncate(data["content"], max_output_chars))
+                            current = None
+                            saw_any = True
+                        elif event_type == "approval_required":
+                            approval = data
+                        elif event_type == "done":
+                            if not saw_any:
+                                print(data["final_text"])
+                            else:
                                 print()
-                            print("Answer...")
-                        current = "answer"
-                        saw_any = True
-                        print(data["text"], end="", flush=True)
-                    elif event_type == "tool_call":
-                        pending_tools[data["id"]] = data
-                    elif event_type == "tool_result":
-                        call = pending_tools.pop(data["tool_call_id"], None)
-                        name = call["name"] if call else data.get("name")
-                        args = call["arguments"] if call else None
-                        if saw_any:
-                            print()
-                        print(f"{name}...")
-                        if args is not None:
-                            print(f"Input: {json.dumps(args, ensure_ascii=False)}")
-                        print("Output:")
-                        print(_truncate(data["content"], max_output_chars))
-                        current = None
-                        saw_any = True
-                    elif event_type == "done":
-                        if not saw_any:
-                            print(data["final_text"])
-                        else:
-                            print()
-                        return 0
-                    elif event_type == "error":
-                        print(f"\n❌ {data['message']}", file=sys.stderr)
-                        return 1
+                            return 0
+                        elif event_type == "error":
+                            print(f"\n❌ {data['message']}", file=sys.stderr)
+                            return 1
+        except httpx.HTTPError as exc:
+            print(f"❌ 无法连接 {base_url}: {exc}", file=sys.stderr)
+            return 1
+        if approval is None:
+            return 1
+        resume_payload = _build_resume_payload(approval, request_payload)
+        if resume_payload is None:
+            return 2
+        request_payload = resume_payload
+        request_endpoint = "/chat/resume/stream"
+
+
+def _resume_pending(args) -> int:
+    """查询并处理某线程在先前进程中留下的待审批批次。"""
+    if not args.thread_id:
+        print("❌ --resume 必须同时提供 --thread-id", file=sys.stderr)
+        return 2
+    params = {
+        key: value
+        for key, value in {
+            "thread_id": args.thread_id,
+            "model": args.model,
+            "provider": args.provider,
+            "protocol": args.protocol,
+        }.items()
+        if value is not None
+    }
+    try:
+        with httpx.Client(base_url=args.base_url, timeout=30) as client:
+            response = client.get("/chat/approval", params=params)
     except httpx.HTTPError as exc:
-        print(f"❌ 无法连接 {base_url}: {exc}", file=sys.stderr)
+        print(f"❌ 无法连接 {args.base_url}: {exc}", file=sys.stderr)
         return 1
-    return 1
+    if response.status_code != 200:
+        return _print_error(response.text)
+    resume_payload = _build_resume_payload(response.json()["approval"], params)
+    if resume_payload is None:
+        return 2
+    return _chat_stream(
+        args.base_url,
+        resume_payload,
+        max_output_chars=args.max_output_chars,
+        endpoint="/chat/resume/stream",
+    )
 
 
 def _interactive(args) -> int:
@@ -287,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
     chat_p = sub.add_parser("chat", help="调用本地 API 对话（不带 --msg 进入交互模式）")
     chat_p.add_argument("--msg", "--message", dest="message", default=None, help="用户消息（不带则进入交互模式；交互默认流式输出）")
     chat_p.add_argument("--stream", action="store_true", help="流式输出（SSE）；交互模式恒为流式")
+    chat_p.add_argument("--resume", action="store_true", help="恢复 --thread-id 指定线程的待审批工具调用")
     chat_p.add_argument("--model", default=None, help="模型名，默认服务端配置")
     chat_p.add_argument("--provider", default=None, help="provider，默认服务端配置")
     chat_p.add_argument("--protocol", default=None, help="protocol，默认服务端配置")

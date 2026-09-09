@@ -279,6 +279,98 @@ def test_truncate_zero_disables():
     assert _truncate("y" * 1000, 0) == "y" * 1000
 
 
+def test_prompt_approval_collects_each_tool_decision(monkeypatch):
+    _mock_input(monkeypatch, ["y", ""])
+    decision = cli_main._prompt_approval(
+        {
+            "approval_id": "approval_1",
+            "tool_calls": [
+                {"id": "c1", "name": "calculator", "arguments": {"expression": "1+1"}},
+                {"id": "c2", "name": "string_len", "arguments": {"text": "ab"}},
+            ],
+        }
+    )
+    assert decision == {
+        "approval_id": "approval_1",
+        "decisions": [
+            {"tool_call_id": "c1", "action": "approve"},
+            {"tool_call_id": "c2", "action": "reject", "reason": "用户拒绝执行"},
+        ],
+    }
+
+
+def test_chat_stream_resumes_after_approval(monkeypatch):
+    import httpx
+
+    requests = []
+    batches = [
+        [
+            ("tool_call", {"id": "c1", "name": "calculator", "arguments": {"expression": "1+1"}}),
+            (
+                "approval_required",
+                {
+                    "approval_id": "approval_1",
+                    "tool_calls": [
+                        {"id": "c1", "name": "calculator", "arguments": {"expression": "1+1"}}
+                    ],
+                },
+            ),
+        ],
+        [
+            ("tool_result", {"tool_call_id": "c1", "name": "calculator", "content": "2"}),
+            ("done", {"thread_id": "t1", "final_text": "答案是 2", "tool_calls": []}),
+        ],
+    ]
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, events):
+            self.events = events
+
+        def iter_lines(self):
+            for event, data in self.events:
+                yield f"event: {event}"
+                yield f"data: {json.dumps(data, ensure_ascii=False)}"
+                yield ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def stream(self, method, endpoint, json):
+            requests.append((endpoint, json))
+            return Response(batches[len(requests) - 1])
+
+    monkeypatch.setattr(httpx, "Client", Client)
+    monkeypatch.setattr(
+        cli_main,
+        "_prompt_approval",
+        lambda approval: {
+            "approval_id": approval["approval_id"],
+            "decisions": [{"tool_call_id": "c1", "action": "approve"}],
+        },
+    )
+    assert cli_main._chat_stream(
+        "http://test", {"message": "计算", "thread_id": "t1"}
+    ) == 0
+    assert requests[0][0] == "/chat/stream"
+    assert requests[1][0] == "/chat/resume/stream"
+    assert requests[1][1]["decisions"][0]["action"] == "approve"
+
+
 def test_main_passes_max_output_chars_arg(monkeypatch):
     """--max-output-chars 参数传到 _chat_stream（一次性模式）。"""
     seen = {}

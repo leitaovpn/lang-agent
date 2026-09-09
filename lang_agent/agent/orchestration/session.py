@@ -12,18 +12,25 @@ context（AgentContext：llm/tools/summarizer_llm）每次调用显式注入，
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.types import Command
 
 from lang_agent.core.loop import AgentContext, AgentLoop, AgentLoopConfig
+from lang_agent.core.loop.approval import (
+    ToolApprovalDecision,
+    ToolApprovalRequest,
+    validate_approval_decision,
+)
 from lang_agent.core.loop.compress import (
     estimate_tokens,
     find_round_start,
     render_messages_for_summary,
 )
 from lang_agent.core.loop.events import (
+    EVENT_APPROVAL_REQUIRED,
     EVENT_DONE,
     EVENT_ERROR,
     AgentEvent,
@@ -36,6 +43,14 @@ from lang_agent.core.loop.events import (
 from lang_agent.core.loop.react_agent import AGENT_NODE
 from lang_agent.core.loop.repair import repair_state_for_checkpoint
 from lang_agent.core.loop.retry import compute_delay, is_retryable
+
+
+class ApprovalPendingError(RuntimeError):
+    """线程已有等待人工处理的工具审批。"""
+
+
+class ApprovalNotFoundError(RuntimeError):
+    """线程当前没有可恢复的审批。"""
 
 
 class ChatSession:
@@ -60,6 +75,50 @@ class ChatSession:
         if system:
             initial["system"] = system
         return initial
+
+    async def get_pending_approval(self, thread_id: str) -> dict[str, Any] | None:
+        """读取线程当前待审批批次；审批数据来自 checkpoint 的 interrupt。"""
+        state = await self.loop.graph.aget_state(self._run_config(thread_id))
+        for pending in state.interrupts:
+            if isinstance(pending.value, dict) and "approval_id" in pending.value:
+                return {**pending.value, "interrupt_id": pending.id}
+        return None
+
+    def _result_from_state(
+        self,
+        state: dict[str, Any],
+        *,
+        thread_id: str,
+        approval: dict[str, Any] | None = None,
+    ) -> ConversationResult:
+        """把 graph 状态塑形成当前轮结果。"""
+        round_messages = messages_after_last_human(state.get("messages", []))
+        final_text = ""
+        for message in reversed(round_messages):
+            if isinstance(message, AIMessage) and isinstance(message.content, str) and message.content:
+                final_text = message.content
+                break
+        return ConversationResult(
+            thread_id=thread_id,
+            final_text=final_text,
+            messages=round_messages,
+            tool_calls=collect_tool_calls(round_messages),
+            status="awaiting_approval" if approval else "completed",
+            approval=approval,
+        )
+
+    def _validate_resume_decision(
+        self, pending: dict[str, Any], decision: dict[str, Any]
+    ) -> None:
+        """在恢复 graph 前校验决定，错误输入不会消耗 checkpoint 的 interrupt。"""
+        request = cast(
+            ToolApprovalRequest,
+            {
+                "approval_id": pending["approval_id"],
+                "tool_calls": pending["tool_calls"],
+            },
+        )
+        validate_approval_decision(request, cast(ToolApprovalDecision, decision))
 
     async def _repair_checkpoint_state(self, thread_id: str) -> None:
         """invoke/stream 之前的入口修复：修复本地记忆（checkpoint）里的历史。
@@ -181,6 +240,9 @@ class ChatSession:
         messages 与 tool_calls 都只含本轮（最后一条 HumanMessage 起）产生的内容，
         不含该 thread 的历史轮次。context 携带本次 run 的 LLM/工具集（每次注入）。
         """
+        pending = await self.get_pending_approval(thread_id)
+        if pending is not None:
+            raise ApprovalPendingError("当前线程有待审批的工具调用，请先提交审批决定")
         ctx = context
         await self._repair_checkpoint_state(thread_id)
         await self._compress_checkpoint_state(thread_id, ctx)
@@ -199,17 +261,49 @@ class ChatSession:
                 if not self._should_retry(exc, attempt):
                     raise
                 await self._wait_before_retry(exc, attempt)
-        round_messages = messages_after_last_human(state["messages"])
-        final_text = ""
-        for message in reversed(round_messages):
-            if isinstance(message, AIMessage) and isinstance(message.content, str) and message.content:
-                final_text = message.content
+        approval = None
+        interrupts = state.get("__interrupt__", [])
+        if interrupts:
+            value = interrupts[0].value
+            if isinstance(value, dict):
+                approval = {**value, "interrupt_id": interrupts[0].id}
+        return self._result_from_state(state, thread_id=thread_id, approval=approval)
+
+    async def resume(
+        self,
+        decision: dict[str, Any],
+        *,
+        thread_id: str,
+        context: AgentContext,
+    ) -> ConversationResult:
+        """提交人工审批决定，从 checkpoint 恢复同一次 graph 运行。"""
+        pending = await self.get_pending_approval(thread_id)
+        if pending is None:
+            raise ApprovalNotFoundError("当前线程没有待审批的工具调用")
+        self._validate_resume_decision(pending, decision)
+        config = self._run_config(thread_id)
+        initial: Any = Command(resume=decision)
+        attempt = 0
+        while True:
+            attempt += 1
+            graph_input = (
+                initial if attempt == 1 else await self._resume_input(thread_id, config, initial)
+            )
+            try:
+                state = await self.loop.invoke(graph_input, config, context=context)
                 break
-        return ConversationResult(
-            thread_id=thread_id,
-            final_text=final_text,
-            messages=round_messages,
-            tool_calls=collect_tool_calls(round_messages),
+            except Exception as exc:
+                if not self._should_retry(exc, attempt):
+                    raise
+                await self._wait_before_retry(exc, attempt)
+        next_approval = None
+        interrupts = state.get("__interrupt__", [])
+        if interrupts:
+            value = interrupts[0].value
+            if isinstance(value, dict):
+                next_approval = {**value, "interrupt_id": interrupts[0].id}
+        return self._result_from_state(
+            state, thread_id=thread_id, approval=next_approval
         )
 
     async def stream(
@@ -227,61 +321,108 @@ class ChatSession:
         - updates 通道给完整 AIMessage（tool_call 决策）与 ToolMessage（tool_result）
         context 携带本次 run 的 LLM/工具集（每次注入，重试续跑沿用同一份）。
         """
-        ctx = context
-        final_text = ""
         try:
+            pending = await self.get_pending_approval(thread_id)
+            if pending is not None:
+                raise ApprovalPendingError("当前线程有待审批的工具调用，请先提交审批决定")
             await self._repair_checkpoint_state(thread_id)
             initial = self._initial_state(query, system)
-            config = self._run_config(thread_id)
-            attempt = 0
-            while True:
-                attempt += 1
-                graph_input = (
-                    initial if attempt == 1 else await self._resume_input(thread_id, config, initial)
-                )
-                try:
-                    async for mode, payload in self.loop.stream(
-                        graph_input,
-                        config,
-                        context=ctx,
-                        stream_mode=["messages", "updates"],
-                    ):
-                        if mode == "messages" and isinstance(payload, tuple) and len(payload) == 2:
-                            chunk, metadata = payload
-                            if isinstance(chunk, BaseMessage) and isinstance(metadata, dict):
-                                event = classify_message_chunk(chunk, metadata)
-                                if event:
-                                    yield event
-                        elif mode == "updates" and isinstance(payload, dict):
-                            for node, delta in payload.items():
-                                if node == AGENT_NODE:
-                                    for message in delta.get("messages", []):
-                                        if (
-                                            isinstance(message, AIMessage)
-                                            and isinstance(message.content, str)
-                                            and message.content
-                                            and not message.tool_calls
-                                            and not message.invalid_tool_calls
-                                        ):
-                                            final_text = message.content
-                                for event in classify_node_update(node, delta):
-                                    yield event
-                    break
-                except Exception as exc:
-                    if not self._should_retry(exc, attempt):
-                        raise
-                    await self._wait_before_retry(exc, attempt)
-            state = await self.loop.graph.aget_state(config)
-            # 只汇总本轮（最后一条 HumanMessage 起）的 tool_calls，不含历史轮次
-            round_messages = messages_after_last_human(state.values.get("messages", []))
-            tool_calls = collect_tool_calls(round_messages)
-            yield AgentEvent(
-                EVENT_DONE,
-                {
-                    "thread_id": thread_id,
-                    "final_text": final_text,
-                    "tool_calls": tool_calls,
-                },
-            )
+            async for event in self._stream_graph(
+                initial, thread_id=thread_id, context=context
+            ):
+                yield event
         except Exception as exc:  # noqa: BLE001 统一转 error 事件，不外泄 traceback
             yield AgentEvent(EVENT_ERROR, {"message": f"{type(exc).__name__}: {exc}"})
+
+    async def resume_stream(
+        self,
+        decision: dict[str, Any],
+        *,
+        thread_id: str,
+        context: AgentContext,
+    ) -> AsyncIterator[AgentEvent]:
+        """流式提交审批决定并继续原 graph 运行。"""
+        try:
+            pending = await self.get_pending_approval(thread_id)
+            if pending is None:
+                raise ApprovalNotFoundError("当前线程没有待审批的工具调用")
+            self._validate_resume_decision(pending, decision)
+            async for event in self._stream_graph(
+                Command(resume=decision), thread_id=thread_id, context=context
+            ):
+                yield event
+        except Exception as exc:  # noqa: BLE001 统一转 error 事件，不外泄 traceback
+            yield AgentEvent(EVENT_ERROR, {"message": f"{type(exc).__name__}: {exc}"})
+
+    async def _stream_graph(
+        self,
+        initial: Any,
+        *,
+        thread_id: str,
+        context: AgentContext,
+    ) -> AsyncIterator[AgentEvent]:
+        """流式驱动新输入或 Command(resume=...)，并统一分类 graph 事件。"""
+        ctx = context
+        final_text = ""
+        config = self._run_config(thread_id)
+        attempt = 0
+        while True:
+            attempt += 1
+            graph_input = (
+                initial if attempt == 1 else await self._resume_input(thread_id, config, initial)
+            )
+            interrupted = False
+            try:
+                async for mode, payload in self.loop.stream(
+                    graph_input,
+                    config,
+                    context=ctx,
+                    stream_mode=["messages", "updates"],
+                ):
+                    if mode == "messages" and isinstance(payload, tuple) and len(payload) == 2:
+                        chunk, metadata = payload
+                        if isinstance(chunk, BaseMessage) and isinstance(metadata, dict):
+                            event = classify_message_chunk(chunk, metadata)
+                            if event:
+                                yield event
+                    elif mode == "updates" and isinstance(payload, dict):
+                        for node, delta in payload.items():
+                            if node == "__interrupt__":
+                                for item in delta:
+                                    if isinstance(item.value, dict):
+                                        yield AgentEvent(
+                                            EVENT_APPROVAL_REQUIRED,
+                                            {**item.value, "interrupt_id": item.id},
+                                        )
+                                        interrupted = True
+                                continue
+                            if node == AGENT_NODE:
+                                for message in delta.get("messages", []):
+                                    if (
+                                        isinstance(message, AIMessage)
+                                        and isinstance(message.content, str)
+                                        and message.content
+                                        and not message.tool_calls
+                                        and not message.invalid_tool_calls
+                                    ):
+                                        final_text = message.content
+                            for event in classify_node_update(node, delta):
+                                yield event
+                break
+            except Exception as exc:
+                if not self._should_retry(exc, attempt):
+                    raise
+                await self._wait_before_retry(exc, attempt)
+        if interrupted:
+            return
+        state = await self.loop.graph.aget_state(config)
+        round_messages = messages_after_last_human(state.values.get("messages", []))
+        tool_calls = collect_tool_calls(round_messages)
+        yield AgentEvent(
+            EVENT_DONE,
+            {
+                "thread_id": thread_id,
+                "final_text": final_text,
+                "tool_calls": tool_calls,
+            },
+        )

@@ -4,7 +4,7 @@
     START → agent（LLM + bind_tools，流式合并）
               ├─ 无 tool_calls → END
               ├─ 只有 invalid_tool_calls（已附错误反馈）→ agent（重试）
-              └─ 有 tool_calls → tools（ToolNode 执行真实工具）→ agent（回环）
+              └─ 有 tool_calls → approval（可中断）→ tools（仅执行获批工具）→ agent
 
 AgentLoop 只负责构建与编译 graph；invoke/stream 与 `graph.ainvoke/astream`
 完全同形透传（输入/输出均不塑形）。llm/tools 每次 run 经 `context=` 注入
@@ -18,6 +18,7 @@ aget_state/aupdate_state 实现。
 globals 求值 AgentState 的 `Annotated[...]` 注解，字符串化会导致 NameError
 （1.2.11 仍是该求值机制）。
 """
+import inspect
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -45,11 +46,20 @@ from langgraph.prebuilt.tool_node import ToolCallWrapper
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, ConfigDict
 
+from .approval import (
+    ToolApprovalDecision,
+    ToolApprovalHook,
+    ToolApprovalItem,
+    approve_all,
+    build_approval_request,
+    validate_approval_decision,
+)
 from .compress import truncate_tool_outputs
 from .repair import INVALID_ID_PREFIX
 
 AGENT_NODE = "agent"
 TOOLS_NODE = "tools"
+APPROVAL_NODE = "approval"
 
 
 class AgentState(TypedDict):
@@ -59,19 +69,20 @@ class AgentState(TypedDict):
     system: str
     raw_input: str
     summary: str  # 早期对话摘要（context 压缩写回；发送时作为 SystemMessage 前缀）
+    tool_approval: ToolApprovalDecision
 
 
 def should_continue(state: AgentState) -> str:
     """循环条件：以最近一条 AIMessage 决定走向（工具结果/错误反馈由固定边处理）。
 
-    - 有合法 tool_calls → tools（执行工具）
+    - 有合法 tool_calls → approval（门禁通过后才执行工具）
     - 只有 invalid_tool_calls（agent 节点已附错误反馈 ToolMessage）→ agent 重试
     - 纯文本回答 → END
     """
     for message in reversed(state["messages"]):
         if isinstance(message, AIMessage):
             if message.tool_calls:
-                return TOOLS_NODE
+                return APPROVAL_NODE
             if message.invalid_tool_calls:
                 return AGENT_NODE
             return END
@@ -115,11 +126,13 @@ class AgentLoopConfig:
     compress_enabled: bool = True
     compress_token_threshold: int = 8000  # 估算 token 超此阈值触发压缩
     compress_keep_last: int = 8  # 保留最近 N 条完整消息
+    # core 消费：工具执行门禁。None 保持自动放行；应用层默认注入人工审批钩子。
+    tool_approval_hook: ToolApprovalHook | None = None
 
 
 ReActNode = Callable[
     [AgentState, RunnableConfig, Runtime[AgentContext]],
-    Awaitable[dict[str, list[BaseMessage]]],
+    Awaitable[dict[str, Any]],
 ]
 """ReAct 节点签名：state/config 由 langgraph 注入，runtime.context 取 AgentContext。"""
 
@@ -242,16 +255,86 @@ def build_default_tools_node() -> ReActNode:
 
     async def tools_node(
         state: AgentState, config: RunnableConfig, runtime: Runtime[AgentContext]
-    ) -> dict[str, list[BaseMessage]]:
+    ) -> dict[str, Any]:
         context = cast(AgentContext, runtime.context)
-        tool_node = ToolNode(
-            context.tools,
-            handle_tool_errors=True,
-            wrap_tool_call=context.wrap_tool_call,
-        )
-        return await tool_node.ainvoke(state, config)
+        approval: ToolApprovalDecision | None = state.get("tool_approval")
+        decisions: dict[str, ToolApprovalItem] = {}
+        if approval:
+            decisions = {
+                item["tool_call_id"]: item for item in approval["decisions"]
+            }
+        latest_index = None
+        for index in range(len(state["messages"]) - 1, -1, -1):
+            candidate = state["messages"][index]
+            if isinstance(candidate, AIMessage) and candidate.tool_calls:
+                latest_index = index
+                break
+        if latest_index is None:
+            return {"messages": [], "tool_approval": {}}
+        latest = cast(AIMessage, state["messages"][latest_index])
+        approved = []
+        rejected = []
+        for call in latest.tool_calls:
+            item = decisions.get(str(call.get("id")))
+            if item is None:
+                continue
+            if item["action"] == "approve":
+                approved.append(call)
+            else:
+                rejected.append(call)
+        messages: list[BaseMessage] = []
+        if approved:
+            approved_ai = latest.model_copy(update={"tool_calls": approved})
+            tool_state = dict(state)
+            tool_state["messages"] = [*state["messages"][:latest_index], approved_ai]
+            tool_node = ToolNode(
+                context.tools,
+                handle_tool_errors=True,
+                wrap_tool_call=context.wrap_tool_call,
+            )
+            result = await tool_node.ainvoke(tool_state, config)
+            messages.extend(result.get("messages", []))
+        for call in rejected:
+            item = decisions[str(call.get("id"))]
+            reason = item.get("reason") or "用户拒绝执行"
+            messages.append(
+                ToolMessage(
+                    content=f"工具调用未执行：{reason}",
+                    tool_call_id=str(call.get("id") or ""),
+                    name=str(call.get("name") or "unknown_tool"),
+                    status="error",
+                )
+            )
+        return {"messages": messages, "tool_approval": {}}
 
     return tools_node
+
+
+def build_default_approval_node(hook: ToolApprovalHook | None = None) -> ReActNode:
+    """构建工具审批节点；门禁决定完整有效后才允许进入工具节点。"""
+    gate = hook or approve_all
+
+    async def approval_node(
+        state: AgentState, config: RunnableConfig, runtime: Runtime[AgentContext]
+    ) -> dict[str, Any]:
+        del config, runtime
+        latest = next(
+            (
+                message
+                for message in reversed(state["messages"])
+                if isinstance(message, AIMessage) and message.tool_calls
+            ),
+            None,
+        )
+        if latest is None:
+            return {"tool_approval": {}}
+        request = build_approval_request([dict(call) for call in latest.tool_calls])
+        decision = gate(request)
+        if inspect.isawaitable(decision):
+            decision = await decision
+        return {"tool_approval": validate_approval_decision(request, decision)}
+
+    return approval_node
 
 
 async def build_checkpointer(config: AgentLoopConfig):
@@ -297,6 +380,7 @@ class AgentLoop:
         config: AgentLoopConfig | None = None,
         agent_node: ReActNode | None = None,
         tools_node: ReActNode | None = None,
+        approval_node: ReActNode | None = None,
     ) -> None:
         self._config = config or AgentLoopConfig()
         if checkpointer is not None:
@@ -314,20 +398,28 @@ class AgentLoop:
         self._graph = self._build_graph(
             agent_node
             or build_default_agent_node(self._config.compress_tool_output_max_chars),
+            approval_node or build_default_approval_node(self._config.tool_approval_hook),
             tools_node or build_default_tools_node(),
         )
 
     def _build_graph(
-        self, agent_node: ReActNode, tools_node: ReActNode
+        self, agent_node: ReActNode, approval_node: ReActNode, tools_node: ReActNode
     ) -> CompiledStateGraph[AgentState, AgentContext, AgentState, AgentState]:
         graph = StateGraph(AgentState, context_schema=AgentContext)
         # runtime 注入在 langgraph 类型定义之外（运行时已验证），类型检查忽略
         graph.add_node(AGENT_NODE, agent_node)  # type: ignore
+        graph.add_node(APPROVAL_NODE, approval_node)  # type: ignore
         graph.add_node(TOOLS_NODE, tools_node)  # type: ignore
         graph.add_edge(START, AGENT_NODE)
         graph.add_conditional_edges(AGENT_NODE, should_continue)
+        graph.add_edge(APPROVAL_NODE, TOOLS_NODE)
         graph.add_edge(TOOLS_NODE, AGENT_NODE)
-        return graph.compile(checkpointer=self._checkpointer)
+        # langgraph 不同补丁版本对 compile() 的 input/output StateT 推断不同；
+        # 本图未声明独立 input/output schema，二者在运行时均为 AgentState。
+        return cast(
+            CompiledStateGraph[AgentState, AgentContext, AgentState, AgentState],
+            graph.compile(checkpointer=self._checkpointer),
+        )
 
     @property
     def graph(self) -> CompiledStateGraph[AgentState, AgentContext, AgentState, AgentState]:

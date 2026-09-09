@@ -4,7 +4,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from lang_agent.core.loop import AgentLoopConfig
+from lang_agent.core.loop import AgentLoopConfig, require_human_approval
 
 load_dotenv()
 
@@ -40,4 +40,5 @@ def loop_config() -> AgentLoopConfig:
         retry_max_attempts=int(os.getenv("LANG_AGENT_RETRY_MAX", "3")),
         retry_base_delay=float(os.getenv("LANG_AGENT_RETRY_BASE_DELAY", "0.5")),
         retryable_exceptions=_retryable_exceptions(),
+        tool_approval_hook=require_human_approval,
     )

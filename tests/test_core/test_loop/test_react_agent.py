@@ -5,12 +5,14 @@
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from lang_agent.core.loop import (
     AgentContext,
     AgentLoop,
     AgentLoopConfig,
     build_checkpointer,
+    require_human_approval,
 )
 from lang_agent.core.tool import instantiate_tools
 from tests.conftest import FakeChatModel
@@ -79,6 +81,106 @@ async def test_tools_node_passes_wrap_tool_call_from_context():
     assert calls == ["calculator"]
     tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
     assert tool_msgs and tool_msgs[0].content == "wrapper 拦截结果"
+
+
+async def test_human_approval_interrupts_before_tool_and_resumes():
+    cfg = AgentLoopConfig(tool_approval_hook=require_human_approval)
+    loop, llm = make_loop(
+        [AIMessage(content="", tool_calls=[TOOL_CALL]), AIMessage(content="计算完成")],
+        config=cfg,
+        checkpointer=InMemorySaver(),
+    )
+    context = make_ctx(llm)
+    run_config = {"configurable": {"thread_id": "approval"}}
+
+    paused = await loop.invoke(
+        {"messages": [HumanMessage(content="计算")], "raw_input": "计算"},
+        run_config,
+        context=context,
+    )
+    assert paused["__interrupt__"][0].value["tool_calls"][0]["name"] == "calculator"
+    state = await loop.graph.aget_state(run_config)
+    assert not any(isinstance(message, ToolMessage) for message in state.values["messages"])
+
+    approval_id = paused["__interrupt__"][0].value["approval_id"]
+    result = await loop.invoke(
+        Command(
+            resume={
+                "approval_id": approval_id,
+                "decisions": [{"tool_call_id": "call_1", "action": "approve"}],
+            }
+        ),
+        run_config,
+        context=context,
+    )
+    tool_messages = [message for message in result["messages"] if isinstance(message, ToolMessage)]
+    assert tool_messages[0].content == "56"
+
+
+async def test_rejected_tool_is_not_executed_and_becomes_tool_message():
+    cfg = AgentLoopConfig(tool_approval_hook=require_human_approval)
+    loop, llm = make_loop(
+        [AIMessage(content="", tool_calls=[TOOL_CALL]), AIMessage(content="已取消计算")],
+        config=cfg,
+        checkpointer=InMemorySaver(),
+    )
+    context = make_ctx(llm)
+    run_config = {"configurable": {"thread_id": "reject"}}
+    paused = await loop.invoke(
+        {"messages": [HumanMessage(content="计算")], "raw_input": "计算"},
+        run_config,
+        context=context,
+    )
+    approval_id = paused["__interrupt__"][0].value["approval_id"]
+    result = await loop.invoke(
+        Command(
+            resume={
+                "approval_id": approval_id,
+                "decisions": [
+                    {"tool_call_id": "call_1", "action": "reject", "reason": "用户拒绝"}
+                ],
+            }
+        ),
+        run_config,
+        context=context,
+    )
+    tool_message = next(message for message in result["messages"] if isinstance(message, ToolMessage))
+    assert tool_message.status == "error"
+    assert "用户拒绝" in tool_message.content
+
+
+async def test_incomplete_approval_never_reaches_tools_node():
+    calls = []
+
+    async def tools_node(state, config, runtime):
+        calls.append("executed")
+        return {"messages": []}
+
+    cfg = AgentLoopConfig(tool_approval_hook=require_human_approval)
+    loop, llm = make_loop(
+        [AIMessage(content="", tool_calls=[TOOL_CALL])],
+        config=cfg,
+        checkpointer=InMemorySaver(),
+        tools_node=tools_node,
+    )
+    run_config = {"configurable": {"thread_id": "invalid-approval"}}
+    paused = await loop.invoke(
+        {"messages": [HumanMessage(content="计算")], "raw_input": "计算"},
+        run_config,
+        context=make_ctx(llm),
+    )
+    with pytest.raises(ValueError, match="完整覆盖"):
+        await loop.invoke(
+            Command(
+                resume={
+                    "approval_id": paused["__interrupt__"][0].value["approval_id"],
+                    "decisions": [],
+                }
+            ),
+            run_config,
+            context=make_ctx(llm),
+        )
+    assert calls == []
 
 
 async def test_system_message_prepended():

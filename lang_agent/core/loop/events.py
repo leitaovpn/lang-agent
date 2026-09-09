@@ -4,13 +4,14 @@
 - thinking_token  模型逐 token 思考内容（reasoning_content，来自 agent chunk 的 additional_kwargs）
 - llm_token   agent 逐 token 文本（来自 messages 流式通道）
 - tool_call   模型发起一次工具调用（来自 updates 通道的完整 AIMessage）
+- approval_required graph 已暂停并等待人工审批
 - tool_result 工具执行结果（来自 updates 通道的 ToolMessage）
 - done        循环正常结束，携带最终文本与工具调用汇总
 - error       循环异常终止，携带错误信息
 """
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import (
     AIMessage,
@@ -26,6 +27,7 @@ EVENT_TOOL_CALL = "tool_call"
 EVENT_TOOL_RESULT = "tool_result"
 EVENT_DONE = "done"
 EVENT_ERROR = "error"
+EVENT_APPROVAL_REQUIRED = "approval_required"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +51,8 @@ class ConversationResult:
     final_text: str
     messages: list[BaseMessage] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    status: Literal["completed", "awaiting_approval"] = "completed"
+    approval: dict[str, Any] | None = None
 
 
 def classify_message_chunk(
