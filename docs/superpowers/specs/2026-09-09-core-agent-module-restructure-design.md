@@ -122,7 +122,7 @@ tests/
 
 - **AGENTS.md**:「架构要点」「已知坑」「开发命令」里的旧路径(`core/react_agent.py`、`agent/session.py` 等)更新为新路径;增加「扩展位」标注(orchestration 未来多 agent 编排器、core/tool 未来鉴权、core/loop 未来新循环形态)
 - **README.md**:代码示例改新路径——`from lang_agent.core import AgentLoop` → `from lang_agent.core.loop import AgentLoop`;`from lang_agent.core.tool_registry import ToolSpec, register_tool` → `from lang_agent.core.tool import ToolSpec, register_tool`;CLI 命令(`python -m lang_agent.agent.cli ...`)不变
-- **CLAUDE.md**:仅引用 AGENTS.md 与命令,路径未硬编码,不改;`.venv_3.13` 与实际 venv 不一致的问题不在本次范围
+- **CLAUDE.md**：仅引用 AGENTS.md 与命令，虚拟环境命名问题不在本次范围
 
 ## 验证方式
 

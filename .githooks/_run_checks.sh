@@ -3,11 +3,11 @@
 set -e
 
 root="$(git rev-parse --show-toplevel)"
-venv="$root/.venv_3.13"
+venv="$root/.venv"
 python="$venv/bin/python"
 
 if [ ! -x "$python" ]; then
-    echo "[git 门禁] 缺少 $venv：请先创建 venv 并执行 .venv_3.13/bin/pip install -r requirements-dev.txt" >&2
+    echo "[git 门禁] 缺少 $venv：请先创建 venv 并执行 .venv/bin/pip install -r requirements-dev.txt" >&2
     exit 1
 fi
 

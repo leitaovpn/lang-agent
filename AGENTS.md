@@ -14,22 +14,22 @@ lang-agent：基于 langgraph 的 lang agent，分三层：
 
 ## 开发命令
 
-环境用仓库内 venv（`.venv_3.13`，Python 3.13.3），**不要用系统 python3**：
+环境用仓库内 venv（`.venv`，Python 3.13.3），**不要用系统 python3**：
 
 ```bash
-.venv_3.13/bin/pip install -r requirements-dev.txt   # 安装依赖（锁精确版本）
-.venv_3.13/bin/python -m pytest                      # 全部测试（126 个）
-.venv_3.13/bin/python -m pytest tests/test_core/test_loop/test_react_agent.py::test_memory_second_round_sees_history   # 单个测试
-.venv_3.13/bin/python -m lang_agent.agent.cli serve --port 8000          # 起服务
-.venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "..." --stream  # CLI 冒烟（一次性）
-.venv_3.13/bin/python -m lang_agent.agent.cli chat                       # 交互模式（默认流式，自动拉起服务）
+.venv/bin/pip install -r requirements-dev.txt   # 安装依赖（锁精确版本）
+.venv/bin/python -m pytest                      # 全部测试（128 个）
+.venv/bin/python -m pytest tests/test_core/test_loop/test_react_agent.py::test_memory_second_round_sees_history   # 单个测试
+.venv/bin/python -m lang_agent.agent.cli serve --port 8000          # 起服务
+.venv/bin/python -m lang_agent.agent.cli chat --msg "..." --stream  # CLI 冒烟（一次性）
+.venv/bin/python -m lang_agent.agent.cli chat                       # 交互模式（默认流式，自动拉起服务）
 ```
 
 lint 与类型检查工具已锁进 dev 依赖：
 
 ```bash
-.venv_3.13/bin/ruff check lang_agent/ tests/                                   # lint
-.venv_3.13/bin/mypy lang_agent tests --explicit-package-bases                  # 类型检查
+.venv/bin/ruff check lang_agent/ tests/                                   # lint
+.venv/bin/mypy lang_agent tests --explicit-package-bases                  # 类型检查
 ```
 
 IDE 类型诊断与运行时同为 Python 3.13，可直接以诊断为准。

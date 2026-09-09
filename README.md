@@ -14,35 +14,46 @@
 
 ```bash
 # Python 3.13+，创建 venv 并安装依赖
-python3 -m venv .venv_3.13
-.venv_3.13/bin/pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 
 # 配置 deepseek API key
 cp .env.example .env
 # 编辑 .env，填入 DEEPSEEK_API_KEY=sk-xxx
 ```
 
+项目提供 `.envrc`，可通过 [direnv](https://direnv.net/) 在进入目录时自动激活 `.venv`，并将 Python 字节码缓存集中写入 `.cache/pycache`。以 macOS + zsh 为例：
+
+```bash
+brew install direnv
+echo 'eval "$(direnv hook zsh)"' >> ~/.zshrc
+source ~/.zshrc
+direnv allow
+```
+
+配置生效后可以直接使用 `python`、`pip`、`pytest` 等命令；不使用 direnv 时，继续通过 `.venv/bin/...` 显式调用即可。`.cache/`、`__pycache__/` 和 `.venv/` 均已加入 Git 忽略规则。
+
 启动服务：
 
 ```bash
-.venv_3.13/bin/python -m lang_agent.agent.cli serve            # 默认 127.0.0.1:8000
+.venv/bin/python -m lang_agent.agent.cli serve            # 默认 127.0.0.1:8000
 ```
 
 CLI 调用（纯 HTTP 客户端，走本地 API）：
 
 ```bash
 # 同步
-.venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "你好"
+.venv/bin/python -m lang_agent.agent.cli chat --msg "你好"
 
 # 流式（token 级打印，工具过程灰显）
-.venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "计算 (3+5)*7" --stream
+.venv/bin/python -m lang_agent.agent.cli chat --msg "计算 (3+5)*7" --stream
 
 # 多轮对话（thread_id 记忆历史）
-.venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "计算 (3+5)*7" --stream --thread-id my-thread
-.venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "再乘 2 是多少" --stream --thread-id my-thread
+.venv/bin/python -m lang_agent.agent.cli chat --msg "计算 (3+5)*7" --stream --thread-id my-thread
+.venv/bin/python -m lang_agent.agent.cli chat --msg "再乘 2 是多少" --stream --thread-id my-thread
 
 # 交互模式（默认流式、多轮上下文连续；无服务端时自动拉起，端口被占自动换端口）
-.venv_3.13/bin/python -m lang_agent.agent.cli chat
+.venv/bin/python -m lang_agent.agent.cli chat
 ```
 
 交互模式内支持 `/help`、`/exit`、`/quit`；Ctrl+C 中断当前生成或退出。
@@ -187,8 +198,8 @@ register_tool(ToolSpec(name="weather", description="查询天气", fn=weather, a
 ## 测试
 
 ```bash
-.venv_3.13/bin/pip install -r requirements-dev.txt
-.venv_3.13/bin/python -m pytest        # 126 个测试，全部用 FakeChatModel 注入，不依赖真实 API key
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest        # 128 个测试，全部用 FakeChatModel 注入，不依赖真实 API key
 ```
 
 ## 已知注意点
