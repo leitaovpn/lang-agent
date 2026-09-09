@@ -1,6 +1,7 @@
 """agent 事件协议：core 层对外的统一事件形态与分类纯函数。
 
 事件类型：
+- thinking_token  模型逐 token 思考内容（reasoning_content，来自 agent chunk 的 additional_kwargs）
 - llm_token   agent 逐 token 文本（来自 messages 流式通道）
 - tool_call   模型发起一次工具调用（来自 updates 通道的完整 AIMessage）
 - tool_result 工具执行结果（来自 updates 通道的 ToolMessage）
@@ -19,6 +20,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+EVENT_THINKING_TOKEN = "thinking_token"
 EVENT_LLM_TOKEN = "llm_token"
 EVENT_TOOL_CALL = "tool_call"
 EVENT_TOOL_RESULT = "tool_result"
@@ -52,10 +54,19 @@ class ConversationResult:
 def classify_message_chunk(
     chunk: BaseMessage, metadata: dict[str, Any]
 ) -> AgentEvent | None:
-    """messages 通道的 chunk 分类：agent 节点的文本 token → llm_token。"""
+    """messages 通道的 chunk 分类：agent 节点的 thinking → thinking_token，文本 → llm_token。
+
+    thinking 增量位于 chunk.additional_kwargs["reasoning_content"]（deepseek 系
+    模型流式行为）；后续内容（content）走 llm_token。
+    """
     if metadata.get("langgraph_node") != "agent":
         return None
-    if isinstance(chunk, AIMessageChunk) and isinstance(chunk.content, str) and chunk.content:
+    if not isinstance(chunk, AIMessageChunk):
+        return None
+    reasoning = chunk.additional_kwargs.get("reasoning_content", "")
+    if isinstance(reasoning, str) and reasoning:
+        return AgentEvent(EVENT_THINKING_TOKEN, {"text": reasoning})
+    if isinstance(chunk.content, str) and chunk.content:
         return AgentEvent(EVENT_LLM_TOKEN, {"text": chunk.content})
     return None
 

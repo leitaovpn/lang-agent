@@ -40,7 +40,13 @@ CLI 调用（纯 HTTP 客户端，走本地 API）：
 # 多轮对话（thread_id 记忆历史）
 .venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "计算 (3+5)*7" --stream --thread-id my-thread
 .venv_3.13/bin/python -m lang_agent.agent.cli chat --msg "再乘 2 是多少" --stream --thread-id my-thread
+
+# 交互模式（默认流式、多轮上下文连续；无服务端时自动拉起，端口被占自动换端口）
+.venv_3.13/bin/python -m lang_agent.agent.cli chat
 ```
+
+交互模式内支持 `/help`、`/exit`、`/quit`；Ctrl+C 中断当前生成或退出。
+工具结果默认截断到 500 字符再打印（`--max-output-chars` 可覆盖，`<=0` 不截断）；`--thread-id` 可续指定会话。
 
 直接调 API：
 
@@ -83,6 +89,7 @@ curl -N -X POST http://127.0.0.1:8000/chat/stream \
 
 | 事件 | data | 说明 |
 |---|---|---|
+| `thinking_token` | `{"text": "..."}` | 模型逐 token 思考（reasoning_content） |
 | `llm_token` | `{"text": "..."}` | agent 逐 token 文本 |
 | `tool_call` | `{"id", "name", "arguments"}` | 模型发起工具调用 |
 | `tool_result` | `{"tool_call_id", "name", "content"}` | 工具执行结果 |
@@ -138,31 +145,33 @@ registry.register(
 手搓 StateGraph 的完整 ReAct 循环：
 
 ```
-START → agent（LLM + bind_tools，流式合并）→ tools_condition
+START → agent（LLM + bind_tools，流式合并）→ should_continue
           ├─ 无 tool_calls → END
           └─ 有 tool_calls → tools（ToolNode 执行真实工具）→ agent（回环）
 ```
 
-统一入口（屏蔽底层 agent 差异）：
+`AgentLoop` 是纯 graph 薄封装：构造只编译 graph，invoke/stream 与 `graph.ainvoke/astream` 同形透传，不持有 LLM/工具——每次 run 经 `context=` 注入：
 
 ```python
 from lang_agent.ai import get_llm
-from lang_agent.core import AgentLoop
+from lang_agent.core.loop import AgentContext, AgentLoop, AgentLoopConfig
 
-loop = AgentLoop(llm=get_llm(model="deepseek-v4-flash"))
+loop = AgentLoop(config=AgentLoopConfig())   # checkpointer 默认 memory
+context = AgentContext(llm=get_llm(model="deepseek-v4-flash"), tools=[])
 
-result = await loop.invoke("计算 (3+5)*7", thread_id="t1")       # 一次性拿结果
-async for event in loop.stream("计算 (3+5)*7", thread_id="t1"):  # token 级事件流
-    print(event.type, event.data)
+cfg = {"configurable": {"thread_id": "t1"}}
+result = await loop.invoke("计算 (3+5)*7", config=cfg, context=context)
+async for chunk in loop.stream("计算 (3+5)*7", config=cfg, context=context):
+    print(chunk)   # 原始事件；结果塑形/事件分类由 agent 层 ChatSession 提供
 ```
 
-多轮记忆：`thread_id` + checkpointer（默认 SQLite 持久化，服务重启不丢）。
+多轮记忆：`thread_id` + checkpointer（memory 或 sqlite 持久化，见 `AgentLoopConfig.checkpointer_kind`）。
 
-**新增工具**（[lang_agent/core/tool_registry.py](lang_agent/core/tool_registry.py) 注册即可）：
+**新增工具**（[lang_agent/core/tool/tool_registry.py](lang_agent/core/tool/tool_registry.py) 注册即可）：
 
 ```python
 from pydantic import BaseModel, Field
-from lang_agent.core.tool_registry import ToolSpec, register_tool
+from lang_agent.core.tool import ToolSpec, register_tool
 
 class Args(BaseModel):
     city: str = Field(description="城市名")
@@ -179,7 +188,7 @@ register_tool(ToolSpec(name="weather", description="查询天气", fn=weather, a
 
 ```bash
 .venv_3.13/bin/pip install -r requirements-dev.txt
-.venv_3.13/bin/python -m pytest        # 101 个测试，全部用 FakeChatModel 注入，不依赖真实 API key
+.venv_3.13/bin/python -m pytest        # 126 个测试，全部用 FakeChatModel 注入，不依赖真实 API key
 ```
 
 ## 已知注意点

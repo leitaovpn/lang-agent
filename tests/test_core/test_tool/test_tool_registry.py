@@ -2,7 +2,7 @@
 import pytest
 from langchain_core.tools import BaseTool
 
-from lang_agent.core.tool_registry import (
+from lang_agent.core.tool import (
     get_tool,
     instantiate_tools,
     register_tool,
@@ -33,7 +33,7 @@ def test_instantiate_tools_returns_base_tools():
 
 
 def test_register_tool_adds_new_tool():
-    from lang_agent.core.tool_registry import ToolSpec
+    from lang_agent.core.tool import ToolSpec
 
     spec = ToolSpec(name="test_echo", description="测试用 echo 工具", fn=lambda s: s, args_schema=None)
     register_tool(spec)

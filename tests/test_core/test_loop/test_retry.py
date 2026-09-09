@@ -1,7 +1,7 @@
 """重试纯函数测试：白名单判定与指数退避。"""
 import httpx
 
-from lang_agent.core.retry import (
+from lang_agent.core.loop.retry import (
     DEFAULT_RETRYABLE_EXCEPTIONS,
     RetryableError,
     compute_delay,

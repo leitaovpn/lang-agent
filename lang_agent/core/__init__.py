@@ -1,20 +1,6 @@
-"""core 层：屏蔽底层 agent 差异的 ReAct agent loop。"""
-from lang_agent.core.events import AgentEvent, ConversationResult
-from lang_agent.core.react_agent import (
-    AgentContext,
-    AgentLoop,
-    AgentLoopConfig,
-    build_checkpointer,
-)
-from lang_agent.core.tool_registry import get_tool, register_tool
+"""core 层：ReAct 循环与工具层。
 
-__all__ = [
-    "AgentContext",
-    "AgentEvent",
-    "AgentLoop",
-    "AgentLoopConfig",
-    "ConversationResult",
-    "build_checkpointer",
-    "get_tool",
-    "register_tool",
-]
+公共 API 位于 loop/tool 子包（见各子包 __init__），本文件不做转发导出：
+- lang_agent.core.loop：AgentLoop / AgentContext / AgentLoopConfig / 事件协议
+- lang_agent.core.tool：工具实现与注册表
+"""

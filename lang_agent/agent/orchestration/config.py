@@ -4,7 +4,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from lang_agent.core import AgentLoopConfig
+from lang_agent.core.loop import AgentLoopConfig
 
 load_dotenv()
 

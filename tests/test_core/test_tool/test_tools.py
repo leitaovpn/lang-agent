@@ -1,7 +1,7 @@
 """内置演示工具行为测试。"""
 import pytest
 
-from lang_agent.core.tools import calculator, string_len, string_reverse
+from lang_agent.core.tool.tools import calculator, string_len, string_reverse
 
 
 def test_calculator_basic():

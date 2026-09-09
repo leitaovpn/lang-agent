@@ -5,7 +5,7 @@
 """
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from lang_agent.core.repair import repair_state_for_checkpoint
+from lang_agent.core.loop.repair import repair_state_for_checkpoint
 
 
 def test_state_repair_fixes_segment_before_trailing_text_ai():

@@ -67,6 +67,15 @@ class FakeChatModel(BaseChatModel):
             AIMessage,
             self._generate(messages, stop=stop, run_manager=run_manager, **kwargs).generations[0].message,
         )
+        # thinking（reasoning_content 增量）在内容之前逐 token 产出，与 deepseek 实测流一致
+        reasoning = message.additional_kwargs.get("reasoning_content", "")
+        if isinstance(reasoning, str):
+            for token in reasoning:
+                yield ChatGenerationChunk(
+                    message=AIMessageChunk(
+                        content="", additional_kwargs={"reasoning_content": token}
+                    )
+                )
         if isinstance(message.content, str):
             for token in message.content:
                 yield ChatGenerationChunk(message=AIMessageChunk(content=token))
@@ -86,11 +95,20 @@ class FakeChatModel(BaseChatModel):
                 )
             )
         if message.invalid_tool_calls:
+            # 与真实 deepseek 流一致：tool_call 增量带残缺 args（非 JSON），
+            # agent_node 合并后严格解析失败才判 invalid——而不是直接把
+            # invalid_tool_calls 放进 chunk（合并会被 __add__ 宽容解析误判为合法）。
+            chunks: list[dict[str, Any]] = [
+                {
+                    "name": inv.get("name") or "",
+                    "args": inv.get("args") or "",
+                    "id": inv.get("id"),
+                    "index": i,
+                }
+                for i, inv in enumerate(message.invalid_tool_calls)
+            ]
             yield ChatGenerationChunk(
-                message=AIMessageChunk(
-                    content="",
-                    invalid_tool_calls=list(message.invalid_tool_calls),
-                )
+                message=AIMessageChunk(content="", tool_call_chunks=cast(Any, chunks))
             )
 
 

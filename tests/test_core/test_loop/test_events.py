@@ -1,7 +1,7 @@
 """事件分类纯函数与 SSE 序列化测试。"""
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
-from lang_agent.core.events import (
+from lang_agent.core.loop.events import (
     AgentEvent,
     classify_message_chunk,
     classify_node_update,
@@ -28,6 +28,19 @@ def test_token_from_agent_chunk():
     chunk = AIMessageChunk(content="你好")
     event = classify_message_chunk(chunk, {"langgraph_node": "agent"})
     assert event == AgentEvent("llm_token", {"text": "你好"})
+
+
+def test_thinking_chunk_emits_thinking_token():
+    chunk = AIMessageChunk(content="", additional_kwargs={"reasoning_content": "想"})
+    event = classify_message_chunk(chunk, {"langgraph_node": "agent"})
+    assert event == AgentEvent("thinking_token", {"text": "想"})
+
+
+def test_thinking_then_content_chunks_classify_separately():
+    chunk = AIMessageChunk(content="", additional_kwargs={"reasoning_content": "想"})
+    assert classify_message_chunk(chunk, {"langgraph_node": "agent"}).type == "thinking_token"
+    chunk2 = AIMessageChunk(content="答")
+    assert classify_message_chunk(chunk2, {"langgraph_node": "agent"}).type == "llm_token"
 
 
 def test_chunk_from_tools_node_ignored():

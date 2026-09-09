@@ -2,7 +2,7 @@
 import pytest
 from pydantic import ValidationError
 
-from lang_agent.agent.schemas import ChatRequest, ChatResponse
+from lang_agent.agent.orchestration.schemas import ChatRequest, ChatResponse
 
 
 def test_chat_request_defaults():

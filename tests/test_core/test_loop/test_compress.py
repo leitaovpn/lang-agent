@@ -1,7 +1,7 @@
 """context 压缩纯函数测试：切点规则、摘要渲染、工具输出截断。"""
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from lang_agent.core.compress import (
+from lang_agent.core.loop.compress import (
     estimate_tokens,
     find_round_start,
     render_messages_for_summary,

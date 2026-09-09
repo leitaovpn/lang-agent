@@ -1,4 +1,4 @@
-"""工具注册表：内置演示工具 + 扩展口（不做 tool 鉴权）。"""
+"""工具注册表：内置演示工具 + 扩展口（工具鉴权未来在本包新增模块）。"""
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -8,7 +8,7 @@ from langchain_community.agent_toolkits.load_tools import load_tools
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel
 
-from lang_agent.core import tools as builtin_tools
+from . import tools
 
 
 @dataclass(slots=True)
@@ -59,24 +59,24 @@ register_tool(
     ToolSpec(
         name="calculator",
         description="安全计算数学表达式（仅支持数字、括号与 + - * / ** % // 运算），如 '(3+5)*7'",
-        fn=builtin_tools.calculator,
-        args_schema=builtin_tools.CalculatorArgs,
+        fn=tools.calculator,
+        args_schema=tools.CalculatorArgs,
     )
 )
 register_tool(
     ToolSpec(
         name="string_reverse",
         description="反转字符串",
-        fn=builtin_tools.string_reverse,
-        args_schema=builtin_tools.StringReverseArgs,
+        fn=tools.string_reverse,
+        args_schema=tools.StringReverseArgs,
     )
 )
 register_tool(
     ToolSpec(
         name="string_len",
         description="返回字符串长度",
-        fn=builtin_tools.string_len,
-        args_schema=builtin_tools.StringLenArgs,
+        fn=tools.string_len,
+        args_schema=tools.StringLenArgs,
     )
 )
 
