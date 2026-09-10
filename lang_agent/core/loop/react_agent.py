@@ -449,7 +449,10 @@ class AgentLoop:
     ) -> CompiledStateGraph[AgentState, AgentContext, AgentState, AgentState]:
         graph = StateGraph(AgentState, context_schema=AgentContext)
 
-        # runtime 注入在 langgraph 类型定义之外（运行时已验证），类型检查忽略
+        # runtime 位置注入在 langgraph 类型定义之外（运行时已验证）：
+        # 1.2.x 的 StateNode 只有 (state, *, runtime) 形式，不支持
+        # (state, config, runtime) 组合（Runtime 不含 config），
+        # 故 add_node 处用 cast 显式豁免类型检查。
         def guarded(node):
             async def execute(
                 state: AgentState,
@@ -461,8 +464,8 @@ class AgentLoop:
 
             return execute
 
-        graph.add_node(AGENT_NODE, guarded(agent_node))
-        graph.add_node(TOOLS_NODE, guarded(tools_node))
+        graph.add_node(AGENT_NODE, cast(Any, guarded(agent_node)))
+        graph.add_node(TOOLS_NODE, cast(Any, guarded(tools_node)))
         for hook in NODE_HOOKS:
 
             def dispatcher(name):
@@ -477,7 +480,7 @@ class AgentLoop:
 
                 return execute
 
-            graph.add_node(hook, dispatcher(hook))
+            graph.add_node(hook, cast(Any, dispatcher(hook)))
         graph.add_edge(START, "before_agent")
         graph.add_edge("before_agent", "before_model")
         graph.add_edge("before_model", AGENT_NODE)
