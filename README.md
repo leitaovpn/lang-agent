@@ -225,7 +225,7 @@ scripts/setup-check-venv.sh       # 创建 .venv-check（mypy 兼容版）
 from langchain_core.messages import SystemMessage
 from lang_agent.agent.orchestration import ChatSession
 from lang_agent.core.loop import AgentContext, AgentLoop
-from lang_agent.core.plugin import PluginBase, PluginRegistry
+from lang_agent.plugin import PluginBase, PluginRegistry
 
 class PromptPlugin(PluginBase):
     name = "prompt"
@@ -260,7 +260,7 @@ result = await session.invoke("你好", thread_id="t1", context=AgentContext(llm
 在相同注册表中增加 `ToolApprovalPlugin`：
 
 ```python
-from lang_agent.core.plugin.approval import ToolApprovalPlugin
+from lang_agent.plugin.approval import ToolApprovalPlugin
 
 registry.register(ToolApprovalPlugin(), agent_id=loop.agent_id, hooks=["before_tool"])
 loop.update_plugin_hooks(registry.snapshot(agent_id=loop.agent_id))

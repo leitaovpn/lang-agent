@@ -23,13 +23,11 @@ TOOL_CALL = {
 }
 
 
-def make_loop(script, *, checkpointer=None, config=None, agent_node=None, tools_node=None):
+def make_loop(script, *, checkpointer=None, config=None):
     llm = FakeChatModel(responses=list(script))
     loop = AgentLoop(
         config=config,
         checkpointer=checkpointer,
-        agent_node=agent_node,
-        tools_node=tools_node,
     )
     return loop, llm
 
@@ -249,30 +247,11 @@ async def test_default_checkpointer_is_memory():
 # ---- 新契约：节点注入 / context 必选 / 同形透传 ----
 
 
-async def test_injected_agent_node_is_used():
-    async def fake_agent_node(state, config, runtime):
-        return {"messages": [AIMessage(content="注入节点回答")]}
-
-    loop = AgentLoop(checkpointer=InMemorySaver(), agent_node=fake_agent_node)
-    ctx = AgentContext(llm=FakeChatModel(responses=[]), tools=[])
-    state = await loop.graph.ainvoke(
-        {"messages": [HumanMessage(content="问")]},
-        {"configurable": {"thread_id": "t1"}},
-        context=ctx,
-    )
-    assert state["messages"][-1].content == "注入节点回答"
-
-
-async def test_injected_tools_node_is_used():
-    async def fake_tools_node(state, config, runtime):
-        return {"messages": [ToolMessage(content="fake 工具结果", tool_call_id="c1", name="calculator")]}
-
-    loop = AgentLoop(checkpointer=InMemorySaver(), tools_node=fake_tools_node)
-    llm = FakeChatModel(responses=[AIMessage(content="", tool_calls=[TOOL_CALL]), AIMessage(content="工具已执行")])
-    state = await run_graph(loop, "算一下", ctx=make_ctx(llm))
-    assert state["messages"][-1].content == "工具已执行"
-    tool_msgs = [m for m in state["messages"] if isinstance(m, ToolMessage)]
-    assert tool_msgs and tool_msgs[0].content == "fake 工具结果"
+async def test_constructor_rejects_node_injection():
+    with pytest.raises(TypeError, match="agent_node"):
+        AgentLoop(agent_node=lambda *a: None)
+    with pytest.raises(TypeError, match="tools_node"):
+        AgentLoop(tools_node=lambda *a: None)
 
 
 async def test_invoke_requires_context():

@@ -49,7 +49,7 @@ IDE 类型诊断与运行时同为 Python 3.13，可直接以诊断为准。
 ## 架构要点
 
 - **State**：`AgentState` TypedDict，`messages: Annotated[list[AnyMessage], add_messages]`（`AnyMessage` 来自 langchain_core.messages，`add_messages` 来自 langgraph.graph.message），外加只读元数据字段 `system`、`raw_input`
-- **AgentLoop 薄封装契约**（core/loop/react_agent.py）：构造只编译 graph——入参 `checkpointer` / `config` / `agent_node` / `tools_node`（节点缺省用模块级工厂 `build_default_agent_node(compress_tool_output_max_chars)` / `build_default_tools_node()`，签名 `ReActNode`）；`invoke(input, config, *, context, **kwargs)` / `stream(...)` 与 `graph.ainvoke/astream` **完全同形透传**（stream 是普通函数，产出原始 `(mode, payload)` 元组，不做事件分类）；**context 必传**（core 运行时断言，langgraph 对 None 静默放行）；`loop.graph` 暴露 `CompiledStateGraph`（agent 层 repair/compress 用 `aget_state/aupdate_state`）。默认节点在构造时捕获 config 截断参数（构造后改配置不生效）
+- **AgentLoop 薄封装契约**（core/loop/react_agent.py）：构造只编译 graph——入参 `checkpointer` / `config`；节点固定用模块级工厂 `build_default_agent_node(compress_tool_output_max_chars)` / `build_default_tools_node()`（签名 `ReActNode`），不支持注入自定义节点（旁路 wrap hook 保证，见 docs/superpowers/specs/plugin.md 第 15 节）；`invoke(input, config, *, context, **kwargs)` / `stream(...)` 与 `graph.ainvoke/astream` **完全同形透传**（stream 是普通函数，产出原始 `(mode, payload)` 元组，不做事件分类）；**context 必传**（core 运行时断言，langgraph 对 None 静默放行）；`loop.graph` 暴露 `CompiledStateGraph`（agent 层 repair/compress 用 `aget_state/aupdate_state`）。默认节点在构造时捕获 config 截断参数（构造后改配置不生效）
 - **LLM/tools 经 langgraph context 注入**：`AgentContext`（pydantic，`arbitrary_types_allowed=True`）承载 llm + tools（+ 可选 `summarizer_llm` + 可选 `wrap_tool_call` 工具拦截器），`StateGraph(AgentState, context_schema=AgentContext)` 声明（**不是** `compile()` 参数——0.6.11 实测报错，1.2.11 位置参数不变）；每次 run 经 `invoke/stream` 的 `context=` 注入（重试续跑沿用同一份），由 agent 层（`agent/orchestration/deps.py` 的 `get_deps`）按请求参数构造并缓存。**节点不能以 `context` 参数名接收**（1.2.11 的节点参数注入白名单仍无 `context`），正确姿势是接收注入的 `runtime` 对象，用 `runtime.context` 访问；工具节点按 `runtime.context.tools` 动态构建 `ToolNode(context.tools, handle_tool_errors=True, awrap_tool_call=组合拦截器).ainvoke(state, config)`（handle_tool_errors 必须显式 True，见已知坑 #7；旧 wrap_tool_call 为 None 时跳过兼容层）
 - **context 压缩**（`core/loop/compress.py` 纯逻辑 + `ChatSession._compress_checkpoint_state`）：invoke/stream 入口在 repair 之后执行。token 估算（`estimate_tokens`：优先 `llm.get_num_tokens_from_messages`，**依赖 transformers 缺失时抛 ImportError，退回字符/4 兜底**——不要把异常静默吞成「跳过压缩」）超 `compress_token_threshold`（默认 8000）触发：保留最近 `compress_keep_last`（默认 8）条，**切点由 `find_round_start` 落在轮起点**（tool_call 段永不拆散，压缩后仍满足 repair 不变式），更早轮次交给 `summarizer_llm`（缺省复用对话 llm，注意会消耗其调用额度）总结，摘要**追加**到 `AgentState.summary` 并 RemoveMessage 删旧消息写回 checkpoint。发送视图：summary 作为 SystemMessage 前缀（在 system 提示之后）+ `truncate_tool_outputs` 截断超长工具输出（只缩 content 不写回）。参数可配：`compress_enabled` / `compress_token_threshold` / `compress_keep_last` / `compress_tool_output_max_chars`
 - **拓扑**：固定六个 hook 调度节点包围 agent/tools；具体连线及版本语义见文末 Plugin 模式。
@@ -84,7 +84,7 @@ IDE 类型诊断与运行时同为 Python 3.13，可直接以诊断为准。
 
 ## Plugin 模式（2026-09-10）
 
-- `core/plugin/` 实现 PluginBase、按 agent_id 隔离的 PluginRegistry、RunnableCallable 双函数节点、无持久 checkpoint 的内部 hook graph、wrap 调用链、版本发布与工具审批。plugin 不反向 import loop/agent；具体 state/context 仍在 react_agent，避免类型移动引入循环导入。
+- `lang_agent/plugin/` 实现 PluginBase、按 agent_id 隔离的 PluginRegistry、RunnableCallable 双函数节点、无持久 checkpoint 的内部 hook graph、wrap 调用链、版本发布与工具审批。plugin 不反向 import loop/agent；具体 state/context 仍在 react_agent，避免类型移动引入循环导入。
 - 新建 AgentLoop 自动生成只读 agent_id；创建 loop 后按其 id 注册，再 `update_plugin_hooks(snapshot)` 发布。固定主图为 START → before_agent → before_model → agent → after_model →（before_tool → tools → after_tool → before_model / before_model / after_agent → END）。默认 recursion_limit=80。
 - 内部 graph `compile(checkpointer=False)`；六个固定 dispatcher 调用本轮 bundle 中的 graph。before/abefore 等方法放入同一 RunnableCallable，仅同步时显式补线程异步适配器；RunnableCallable 原生 ainvoke fallback 不切线程。
 - ChatSession 在 initial state 写入 agent_id/run_id/plugin_revision，绑定 context 副本，不修改缓存的 context。动态更新只影响新轮次；重试/审批恢复必须加载原 bundle。插件配置放入 config，注册时复制；历史定义由部署装配重新加载。
@@ -93,4 +93,4 @@ IDE 类型诊断与运行时同为 Python 3.13，可直接以诊断为准。
 - repair 区分 after_model/before_tool/tools 的待执行批，不能给待审批调用合成缺失结果；审批恢复不做 repair/compress。普通新轮次 invoke/stream 都执行 repair → compress。
 - 模型 wrapper 包裹流式 terminal；最终响应仍规范化为普通 AIMessage，invalid 确定性 id 与 repair 保持一致。主模型 token 带 plugin_model_role=primary，辅助调用不外发；after hook 的最终结果由 checkpoint 塑形。需要审核的插件声明 requires_buffered_output。
 - 工具链统一接 ToolNode.awrap_tool_call，旧同步 wrap_tool_call 经桥接放在插件链最内层。默认 handle_tool_errors=True；PluginError 在工具节点出口重新抛出，避免契约错误被吞成业务结果。ToolApprovalPlugin 拒绝时不执行 wrapper 或工具，批准参数在 terminal 再验证。
-- 新测试位于 tests/test_core/test_plugin，覆盖身份隔离、双函数、消息增量、审批更新/恢复、sqlite 重启、缓存/同步桥接、迁移和取消；server/CLI 同步测试接口闭环。
+- 新测试位于 tests/test_plugin，覆盖身份隔离、双函数、消息增量、审批更新/恢复、sqlite 重启、缓存/同步桥接、迁移和取消；server/CLI 同步测试接口闭环。

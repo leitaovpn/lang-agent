@@ -401,7 +401,9 @@ async def build_checkpointer(config: AgentLoopConfig):
 class AgentLoop:
     """ReAct agent 循环的纯 graph 薄封装。
 
-    - 构造时只编译 graph（checkpointer、config、可选注入的 agent_node/tools_node）；
+    - 构造时只编译 graph（checkpointer、config）；节点固定用默认工厂
+      build_default_agent_node / build_default_tools_node，不支持注入自定义节点
+      （旁路 wrap hook 的执行保证，见 docs/superpowers/specs/plugin.md 第 15 节）；
       不持有任何 LLM/工具。
     - invoke/stream 与 `graph.ainvoke/astream` 完全同形透传：输入/输出均不塑形，
       stream 产出原始 (mode, payload) 元组（stream_mode 为列表时）。
@@ -414,17 +416,9 @@ class AgentLoop:
         *,
         checkpointer: BaseCheckpointSaver | None = None,
         config: AgentLoopConfig | None = None,
-        agent_node: ReActNode | None = None,
-        tools_node: ReActNode | None = None,
-        node_wrap_hooks: frozenset[str] = frozenset(),
     ) -> None:
         self._agent_id = uuid4().hex
         self._plugins = PluginRuntime(self._agent_id)
-        self._custom_agent = agent_node is not None
-        self._custom_tools = tools_node is not None
-        if node_wrap_hooks - {"wrap_model_hook", "wrap_tool_hook"}:
-            raise PluginError("未知自定义节点 wrap 能力")
-        self._node_wrap_hooks = node_wrap_hooks
         self._config = config or AgentLoopConfig()
         if checkpointer is not None:
             self._checkpointer = checkpointer
@@ -437,11 +431,12 @@ class AgentLoop:
                 "sqlite checkpointer 必须在异步上下文中创建："
                 "请先 await build_checkpointer(config) 再注入 checkpointer 参数"
             )
-        # 默认节点在构造时捕获 config 的截断参数（构造后改配置不生效）
+        # 固定使用内置默认节点：自定义节点会旁路 wrap hook 的执行保证，
+        # 不支持注入（见 docs/superpowers/specs/plugin.md 第 15 节）。
+        # 默认节点在构造时捕获 config 的截断参数（构造后改配置不生效）。
         self._graph = self._build_graph(
-            agent_node
-            or build_default_agent_node(self._config.compress_tool_output_max_chars),
-            tools_node or build_default_tools_node(),
+            build_default_agent_node(self._config.compress_tool_output_max_chars),
+            build_default_tools_node(),
         )
 
     def _build_graph(
@@ -532,19 +527,6 @@ class AgentLoop:
     def update_plugin_hooks(
         self, snapshot: PluginSpecSnapshot, *, expected_revision: str | None = None
     ):
-        for registration in snapshot.registrations:
-            if (
-                self._custom_agent
-                and "wrap_model_hook" not in self._node_wrap_hooks
-                and registration.hook("wrap_model_hook")
-            ):
-                raise PluginError("自定义 agent_node 未声明 wrap_model 能力")
-            if (
-                self._custom_tools
-                and "wrap_tool_hook" not in self._node_wrap_hooks
-                and registration.hook("wrap_tool_hook")
-            ):
-                raise PluginError("自定义 tools_node 未声明 wrap_tool 能力")
         return self._plugins.update(snapshot, expected_revision)
 
     def describe_plugin_hooks(self, revision: str | None = None) -> dict[str, Any]:
