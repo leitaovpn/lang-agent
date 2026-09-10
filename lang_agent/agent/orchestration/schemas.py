@@ -28,5 +28,7 @@ class ResumeRequest(ChatRequest):
     """只接受服务器已知 agent 上的待审批 id，不追加用户消息。"""
 
     message: str = ""
-    agent_id: str
+    # pydantic 支持的继承字段收紧（可选 → 必填，str | None → str），
+    # 破坏 LSP 是刻意为之：恢复请求必须显式指定 agent。
+    agent_id: str  # pyright: ignore[reportGeneralTypeIssues, reportIncompatibleVariableOverride]
     answers: dict[str, Any] | None = None

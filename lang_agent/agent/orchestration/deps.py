@@ -5,6 +5,8 @@ import json
 from dataclasses import dataclass
 from uuid import uuid4
 
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
 from lang_agent.ai import get_llm
 from lang_agent.core.loop import (
     AgentContext,
@@ -62,6 +64,7 @@ async def get_deps(
             checkpointer = await build_checkpointer(cfg)
             restored_id = None
             if cfg.checkpointer_kind == "sqlite":
+                assert isinstance(checkpointer, AsyncSqliteSaver)
                 conn = checkpointer.conn
                 await conn.execute(
                     "CREATE TABLE IF NOT EXISTS lang_agent_identity (identity_key TEXT PRIMARY KEY, agent_id TEXT NOT NULL UNIQUE)"
@@ -77,9 +80,11 @@ async def get_deps(
                     (identity_key,),
                 ) as cursor:
                     row = await cursor.fetchone()
+                    if row is None:
+                        raise RuntimeError("agent 身份表读取失败")
                     restored_id = row[0]
             if agent_id and agent_id != restored_id:
-                if cfg.checkpointer_kind == "sqlite":
+                if isinstance(checkpointer, AsyncSqliteSaver):
                     await checkpointer.conn.close()
                 raise ValueError("未知 agent_id，不能通过请求创建 agent")
             loop = (
