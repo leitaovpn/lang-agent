@@ -205,6 +205,13 @@ register_tool(ToolSpec(name="weather", description="查询天气", fn=weather, a
 .venv/bin/python -m pytest        # 全量测试，使用 FakeChatModel 注入，不依赖真实 API key
 ```
 
+类型检查除主 venv 的 mypy 外，另有旧版交叉检查（能发现新版推断漏检的
+问题，对应 IDE 常见 mypy 版本），一次性安装后由 git 门禁自动执行：
+
+```bash
+scripts/setup-check-venv.sh       # 创建 .venv-check（mypy 兼容版）
+```
+
 ## 已知注意点
 
 - langgraph 1.2.11 + langchain-core 1.6.2 的组合有几个坑（节点内 config 传递、TypedDict 注解、AsyncSqliteSaver 异步创建、ToolNode handle_tool_errors、chunk 合并对 invalid_tool_calls 的误判等），已在代码注释与 `tests/conftest.py` 中固化写法，改动 core/ai 层前建议先看现有实现

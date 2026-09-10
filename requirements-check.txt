@@ -1,0 +1,4 @@
+# 旧版 mypy 交叉检查（独立 venv：.venv-check）
+# IDE 常见版本推断更保守，可发现主版本漏检的 return-value 等问题；
+# 与 _run_checks.sh / ci.yml 中的调用约定保持一致，升级需同步验证。
+mypy==1.18.2

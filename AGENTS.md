@@ -32,11 +32,17 @@ lint 与类型检查工具已锁进 dev 依赖：
 .venv/bin/mypy lang_agent tests --explicit-package-bases                  # 类型检查
 ```
 
+mypy 额外做**双版本交叉检查**：主 venv 为当前版（requirements-dev.txt），
+`.venv-check` 为兼容版（requirements-check.txt，旧版推断更保守，能发现
+新版漏检的 return-value 等问题，对应 IDE 常见 mypy 版本）。一次性安装：
+`scripts/setup-check-venv.sh`，之后用 `.venv-check/bin/mypy --python-executable
+.venv/bin/python lang_agent tests --explicit-package-bases` 运行。
+
 IDE 类型诊断与运行时同为 Python 3.13，可直接以诊断为准。
 
 ### 提交门禁（push / merge 前自动校验）
 
-- **本地钩子**（`.githooks/`）：`pre-push` 与 `pre-merge-commit` 都会跑 ruff + mypy + pytest 全量校验，任一失败即中止。一次性启用：`git config core.hooksPath .githooks`（新克隆需重新执行）。
+- **本地钩子**（`.githooks/`）：`pre-push` 与 `pre-merge-commit` 都会跑 ruff + mypy（新旧双版）+ pytest 全量校验，任一失败即中止。一次性启用：`git config core.hooksPath .githooks`（新克隆需重新执行），并执行 `scripts/setup-check-venv.sh` 安装兼容 mypy。
 - **CI**（`.github/workflows/ci.yml`）：push 与 PR 双触发，跑同一套校验（ubuntu + Python 3.13）。
 - **合并门禁**：PR 合并前要求 CI 通过，需在 GitHub 仓库 Settings → Branches 对 main 开启 branch protection，勾选 Require status checks（`checks` job）。本地 `git merge`（非 fast-forward）由 pre-merge-commit 钩子把关；ff 合并的分支已在 push 时被校验。
 

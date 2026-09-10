@@ -18,9 +18,15 @@ jobs:
             requirements-dev.txt
       - name: 安装依赖
         run: pip install -r requirements-dev.txt
+      - name: 安装兼容 mypy（.venv-check）
+        run: |
+          python -m venv .venv-check
+          .venv-check/bin/pip install -q -r requirements-check.txt
       - name: ruff
         run: ruff check lang_agent/ tests/
       - name: mypy
         run: mypy lang_agent tests --explicit-package-bases
+      - name: mypy 交叉检查（兼容版）
+        run: .venv-check/bin/mypy --python-executable python lang_agent tests --explicit-package-bases
       - name: pytest
         run: python -m pytest -q
