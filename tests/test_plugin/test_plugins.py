@@ -11,7 +11,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from lang_agent.agent.orchestration.session import ChatSession
 from lang_agent.core.loop import AgentContext, AgentLoop
-from lang_agent.core.plugin import HookPause, HookResult, PluginBase, PluginRegistry
+from lang_agent.plugin import HookPause, HookResult, PluginBase, PluginRegistry
 from tests.conftest import FakeChatModel
 
 
@@ -263,7 +263,7 @@ async def test_update_during_run_keeps_snapshot():
 async def test_sqlite_approval_survives_restart(tmp_path):
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-    from lang_agent.core.plugin.approval import ToolApprovalPlugin
+    from lang_agent.plugin.approval import ToolApprovalPlugin
 
     path = str(tmp_path / "approval.sqlite")
     executed = []
@@ -308,7 +308,7 @@ async def test_sqlite_approval_survives_restart(tmp_path):
 
 @pytest.mark.parametrize("approval_name", ["tool_approval", "custom_approval"])
 async def test_approval_reject_never_enters_wrapper(approval_name):
-    from lang_agent.core.plugin.approval import ToolApprovalPlugin
+    from lang_agent.plugin.approval import ToolApprovalPlugin
 
     calls = []
 
@@ -346,7 +346,7 @@ async def test_approval_reject_never_enters_wrapper(approval_name):
 def test_enforce_approval_follows_registered_name_and_rejects_ambiguity():
     from types import SimpleNamespace
 
-    from lang_agent.core.plugin.approval import enforce_approval
+    from lang_agent.plugin.approval import enforce_approval
 
     request = SimpleNamespace(tool_call={"id": "c", "name": "x", "args": {}})
 
@@ -464,7 +464,7 @@ async def test_tool_wrapper_contract_error_fails_before_next_model():
 
 
 def test_update_reuses_unchanged_hook_and_rolls_back_conflict():
-    from lang_agent.core.plugin.runtime import PluginRuntime
+    from lang_agent.plugin.runtime import PluginRuntime
 
     runtime = PluginRuntime("a")
     registry = PluginRegistry()
@@ -488,7 +488,7 @@ def test_update_reuses_unchanged_hook_and_rolls_back_conflict():
 
 
 async def test_multiple_approvals_replay_answers_without_repeating_tools():
-    from lang_agent.core.plugin.approval import ToolApprovalPlugin
+    from lang_agent.plugin.approval import ToolApprovalPlugin
 
     called = []
 
@@ -616,7 +616,7 @@ async def test_resume_failed_run_without_new_human_message():
 
 
 async def test_before_agent_interrupt_can_resume_and_missing_revision_fails():
-    from lang_agent.core.plugin import PluginRevisionUnavailable
+    from lang_agent.plugin import PluginRevisionUnavailable
 
     class Pause(PluginBase):
         name = "pause"
@@ -671,7 +671,7 @@ async def test_async_cancellation_releases_session_lock():
 
 
 async def test_model_wrapper_cache_skips_model_and_nested_order():
-    from lang_agent.core.plugin import ModelResponse
+    from lang_agent.plugin import ModelResponse
 
     order = []
 
@@ -703,7 +703,7 @@ async def test_model_wrapper_cache_skips_model_and_nested_order():
 
 
 async def test_invalid_approval_answer_does_not_consume_interrupt():
-    from lang_agent.core.plugin.approval import ToolApprovalPlugin
+    from lang_agent.plugin.approval import ToolApprovalPlugin
 
     loop = AgentLoop()
     install(loop, (ToolApprovalPlugin(), ["before_tool"]))
@@ -733,7 +733,7 @@ async def test_invalid_approval_answer_does_not_consume_interrupt():
 def test_runnable_callable_dispatches_sync_and_async_once():
     from langgraph.runtime import Runtime
 
-    from lang_agent.core.plugin.graph import HookInvocation, build_hook_node
+    from lang_agent.plugin.graph import HookInvocation, build_hook_node
 
     log = []
     registry = PluginRegistry()
@@ -754,7 +754,7 @@ def test_runnable_callable_dispatches_sync_and_async_once():
 
 
 async def test_empty_cached_response_after_tool_does_not_repeat_tool():
-    from lang_agent.core.plugin import ModelResponse
+    from lang_agent.plugin import ModelResponse
 
     calls = []
 

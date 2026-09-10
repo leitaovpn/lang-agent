@@ -48,16 +48,16 @@ from langgraph.prebuilt.tool_node import ToolCallWrapper
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, ConfigDict
 
-from lang_agent.core.plugin import (
+from lang_agent.plugin import (
     ModelRequest,
     ModelResponse,
     PluginError,
     PluginSpecSnapshot,
 )
-from lang_agent.core.plugin.graph import merge_namespaces
-from lang_agent.core.plugin.runtime import CompiledPluginBundle, PluginRuntime
-from lang_agent.core.plugin.types import NODE_HOOKS
-from lang_agent.core.plugin.wrappers import call_sync_wrapper, compose_wrappers
+from lang_agent.plugin.graph import merge_namespaces
+from lang_agent.plugin.runtime import CompiledPluginBundle, PluginRuntime
+from lang_agent.plugin.types import NODE_HOOKS
+from lang_agent.plugin.wrappers import call_sync_wrapper, compose_wrappers
 
 from .compress import truncate_tool_outputs
 from .repair import INVALID_ID_PREFIX
@@ -319,8 +319,8 @@ def build_default_tools_node() -> ReActNode:
         contract_errors: list[PluginError] = []
 
         async def wrapper(request, execute):
-            from lang_agent.core.plugin.approval import enforce_approval
-            from lang_agent.core.plugin.tool_validation import validate_tool_result
+            from lang_agent.plugin.approval import enforce_approval
+            from lang_agent.plugin.tool_validation import validate_tool_result
 
             original_id = request.tool_call["id"]
             request = request.override(

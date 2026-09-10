@@ -110,8 +110,8 @@ async def test_stream_endpoint_sse(client, override_deps):
 
 
 async def test_http_approval_resume(client):
-    from lang_agent.core.plugin import PluginRegistry
-    from lang_agent.core.plugin.approval import ToolApprovalPlugin
+    from lang_agent.plugin import PluginRegistry
+    from lang_agent.plugin.approval import ToolApprovalPlugin
     loop = AgentLoop()
     registry = PluginRegistry()
     registry.register(ToolApprovalPlugin(), agent_id=loop.agent_id, hooks=['before_tool'])

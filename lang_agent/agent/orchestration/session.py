@@ -40,7 +40,7 @@ from lang_agent.core.loop.events import (
 )
 from lang_agent.core.loop.repair import repair_state_for_checkpoint
 from lang_agent.core.loop.retry import compute_delay, is_retryable
-from lang_agent.core.plugin.graph import merge_update
+from lang_agent.plugin.graph import merge_update
 
 
 class ChatSession:
