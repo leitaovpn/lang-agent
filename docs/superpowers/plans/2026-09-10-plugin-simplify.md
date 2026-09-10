@@ -107,6 +107,7 @@ git commit -m "refactor: plugin 包上移到 lang_agent/plugin（纯移动 + imp
 - Modify: `lang_agent/core/loop/react_agent.py`（构造签名、属性、update_plugin_hooks）
 - Modify: `tests/test_core/test_loop/test_react_agent.py`（make_loop helper、删 2 个注入测试、加 1 个拒绝测试）
 - Modify: `AGENTS.md`（AgentLoop 契约行 + Plugin 模式段路径）
+- Modify: `README.md`（两处 `lang_agent.core.plugin` 示例 import 改为 `lang_agent.plugin`）
 
 **Interfaces:**
 - Consumes: Task 1 的 `lang_agent.plugin` 路径
@@ -205,6 +206,16 @@ Expected：全部通过（含新的 `test_constructor_rejects_node_injection`）
 ```
 
 约 87 行，「Plugin 模式」段开头 `core/plugin/` 改为 `lang_agent/plugin/`；约 96 行 `tests/test_core/test_plugin` 改为 `tests/test_plugin`。
+
+- [ ] **Step 8b: 更新 README 示例 import**
+
+README.md 约 228 行与 263 行有两处示例仍引用旧路径：
+
+```bash
+sed -i '' 's/from lang_agent\.core\.plugin/from lang_agent.plugin/g' README.md
+```
+
+改完 `grep -n "core.plugin" README.md` 应为空（Task 1 遗漏的文档同步，实施中发现补齐）。
 
 - [ ] **Step 9: 运行完整门禁**
 
