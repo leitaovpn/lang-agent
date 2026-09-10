@@ -447,7 +447,12 @@ class AgentLoop:
     def _build_graph(
         self, agent_node: ReActNode, tools_node: ReActNode
     ) -> CompiledStateGraph[AgentState, AgentContext, AgentState, AgentState]:
-        graph = StateGraph(AgentState, context_schema=AgentContext)
+        # 显式钉住四个泛型参数：StateGraph 为 StateT/ContextT/InputT/OutputT
+        # 四参泛型，仅靠构造器只绑定前两个，compile() 返回类型里 InputT/
+        # OutputT 悬空，旧版 mypy 无法用声明返回类型反推（report-return-value）。
+        graph: StateGraph[AgentState, AgentContext, AgentState, AgentState] = (
+            StateGraph(AgentState, context_schema=AgentContext)
+        )
 
         # runtime 位置注入在 langgraph 类型定义之外（运行时已验证）：
         # 1.2.x 的 StateNode 只有 (state, *, runtime) 形式，不支持
