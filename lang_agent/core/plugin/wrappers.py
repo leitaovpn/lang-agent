@@ -31,10 +31,15 @@ async def call_sync_wrapper(function: Callable, request: Any, handler: Callable)
 
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="plugin-wrapper")
     context = copy_context()
+
+    # 预绑定参数为无参闭包：run_in_executor 的 TypeVarTuple 签名无法
+    # 直接推断 context.run 的 ParamSpec + *args 转发（pyright 报
+    # reportArgumentType），闭包同样保留 context 快照语义。
+    def run():
+        return context.run(function, request, execute)
+
     try:
-        return await loop.run_in_executor(
-            executor, context.run, function, request, execute
-        )
+        return await loop.run_in_executor(executor, run)
     finally:
         for future in pending:
             future.cancel()

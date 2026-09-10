@@ -50,6 +50,8 @@ class ToolApprovalPlugin(PluginBase):
         decisions = {}
         for call in message.tool_calls:
             key = call["id"]
+            if not key:
+                raise PluginError("工具调用缺少 id，无法审批")
             if key not in runtime.answers:
                 return HookResult(
                     pause=HookPause(
