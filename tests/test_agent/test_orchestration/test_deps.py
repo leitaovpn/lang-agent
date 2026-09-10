@@ -69,3 +69,29 @@ async def test_get_deps_unknown_provider_raises(monkeypatch):
         pass
     else:
         raise AssertionError("应抛出 UnknownProviderError")
+
+
+async def test_sqlite_deps_restores_agent_identity_and_history(tmp_path, monkeypatch):
+    import importlib
+
+    from langchain_core.messages import AIMessage
+
+    from tests.conftest import FakeChatModel
+    module = importlib.import_module('lang_agent.agent.orchestration.deps')
+    monkeypatch.setattr(module, '_deps', {})
+    monkeypatch.setattr(module, 'get_llm', lambda **kwargs: FakeChatModel(responses=[AIMessage(content='答')]))
+    monkeypatch.setattr(module, 'instantiate_tools', list)
+    config = AgentLoopConfig(checkpointer_kind='sqlite', db_path=str(tmp_path / 'identity.sqlite'))
+    first = await module.get_deps(config=config)
+    agent_id = first.session.loop.agent_id
+    await first.session.invoke('上一轮', thread_id='t', context=first.context)
+    await first.session.loop.graph.checkpointer.conn.close()
+    module._deps.clear()
+    second = await module.get_deps(config=config, agent_id=agent_id)
+    try:
+        assert second.session.loop.agent_id == agent_id
+        result = await second.session.invoke('下一轮', thread_id='t', context=second.context)
+        assert result.final_text == '答'
+        assert second.context.llm.seen_messages[0][0].content == '上一轮'
+    finally:
+        await second.session.loop.graph.checkpointer.conn.close()

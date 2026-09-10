@@ -7,6 +7,7 @@
 
 工具结果打印默认截断到 500 字符（--max-output-chars 可覆盖，≤0 不截断）。
 """
+
 import argparse
 import json
 import socket
@@ -112,7 +113,12 @@ def _ensure_server(
     from uvicorn import Config, Server  # 惰性导入：仅自动拉起时需要
 
     server = Server(
-        Config("lang_agent.agent.server:app", host=host, port=free_port, log_level="warning")
+        Config(
+            "lang_agent.agent.server:app",
+            host=host,
+            port=free_port,
+            log_level="warning",
+        )
     )
     if free_port != port:
         print(f"ℹ 端口 {port} 被占用，自动改用 http://{host}:{free_port} 启动服务")
@@ -127,6 +133,31 @@ def _ensure_server(
 
 
 def _chat(args) -> int:
+    if getattr(args, "resume", False):
+        try:
+            answers = json.loads(args.answers)
+        except json.JSONDecodeError:
+            return _print_error("--answers 必须为 JSON 对象")
+        if not isinstance(answers, dict):
+            return _print_error("--answers 必须为 JSON 对象")
+        payload = _build_payload(
+            message="",
+            model=args.model,
+            provider=args.provider,
+            protocol=args.protocol,
+            thread_id=args.thread_id,
+        )
+        resume_payload: dict[str, Any] = {
+            **payload,
+            "agent_id": args.agent_id,
+            "answers": answers,
+        }
+        return _chat_stream(
+            args.base_url,
+            resume_payload,
+            path="/chat/resume/stream",
+            max_output_chars=args.max_output_chars,
+        )
     if args.message is None:
         return _interactive(args)
     payload = _build_payload(
@@ -137,7 +168,9 @@ def _chat(args) -> int:
         thread_id=args.thread_id,
     )
     if args.stream:
-        return _chat_stream(args.base_url, payload, max_output_chars=args.max_output_chars)
+        return _chat_stream(
+            args.base_url, payload, max_output_chars=args.max_output_chars
+        )
     try:
         with httpx.Client(base_url=args.base_url, timeout=120) as client:
             resp = client.post("/chat", json=payload)
@@ -147,18 +180,29 @@ def _chat(args) -> int:
     if resp.status_code != 200:
         return _print_error(resp.text)
     data = resp.json()
+    if data.get("status") == "interrupted":
+        return _continue_approval(args.base_url, payload, data, args.max_output_chars)
     for tool_call in data.get("tool_calls", []):
-        print(f"⚙ {tool_call.get('name')}({json.dumps(tool_call.get('arguments'), ensure_ascii=False)})")
+        print(
+            f"⚙ {tool_call.get('name')}({json.dumps(tool_call.get('arguments'), ensure_ascii=False)})"
+        )
     print(data["answer"])
     return 0
 
 
-def _chat_stream(base_url: str, payload: dict[str, str], *, max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS) -> int:
+def _chat_stream(
+    base_url: str,
+    payload: dict[str, Any],
+    *,
+    max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
+    path: str = "/chat/stream",
+) -> int:
     """SSE 流式打印：Thinking/Answer 打字机 + 工具块（同一 tool_call_id 的 Input/Output 配对）。
 
     标题按段打印：thinking 段 → “Thinking...” 标题；工具轮之后新一轮 content
     → “Answer...” 标题；工具块无标题与内容归属问题（按 tool_call_id 配对打印）。
     """
+    answer_text = ""
     current: str | None = None  # 当前正在输出的段：thinking / answer / None
     saw_any = False  # 是否已输出任何内容（done 时决定是否补 final_text）
     # 工具配对：tool_call → 缓存，同 id 的 tool_result 到达时一起打印
@@ -166,7 +210,7 @@ def _chat_stream(base_url: str, payload: dict[str, str], *, max_output_chars: in
     try:
         with (
             httpx.Client(base_url=base_url, timeout=None) as client,
-            client.stream("POST", "/chat/stream", json=payload) as resp,
+            client.stream("POST", path, json=payload) as resp,
         ):
             if resp.status_code != 200:
                 return _print_error(resp.read().decode("utf-8", errors="replace"))
@@ -188,6 +232,7 @@ def _chat_stream(base_url: str, payload: dict[str, str], *, max_output_chars: in
                         saw_any = True
                         print(data["text"], end="", flush=True)
                     elif event_type == "llm_token":
+                        answer_text += data["text"]
                         if current != "answer":
                             # thinking 段结束后紧接 answer；若从思考段切换，标题紧跟输出
                             if current == "thinking" or saw_any:
@@ -197,6 +242,7 @@ def _chat_stream(base_url: str, payload: dict[str, str], *, max_output_chars: in
                         saw_any = True
                         print(data["text"], end="", flush=True)
                     elif event_type == "tool_call":
+                        answer_text = ""
                         pending_tools[data["id"]] = data
                     elif event_type == "tool_result":
                         call = pending_tools.pop(data["tool_call_id"], None)
@@ -211,8 +257,15 @@ def _chat_stream(base_url: str, payload: dict[str, str], *, max_output_chars: in
                         print(_truncate(data["content"], max_output_chars))
                         current = None
                         saw_any = True
+                    elif event_type == "interrupt":
+                        return _continue_approval(
+                            base_url, payload, data, max_output_chars
+                        )
                     elif event_type == "done":
-                        if not saw_any:
+                        if saw_any and data["final_text"] != answer_text:
+                            print("\n最终回答：")
+                            print(data["final_text"])
+                        elif not saw_any:
                             print(data["final_text"])
                         else:
                             print()
@@ -224,6 +277,40 @@ def _chat_stream(base_url: str, payload: dict[str, str], *, max_output_chars: in
         print(f"❌ 无法连接 {base_url}: {exc}", file=sys.stderr)
         return 1
     return 1
+
+
+def _continue_approval(base_url, payload, data, max_output_chars):
+    """交互终端读取明确答案；脚本模式保留审批并返回独立退出码。"""
+    print("\n等待审批：")
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    if not sys.stdin.isatty():
+        print(
+            "使用 chat --resume --agent-id <agent_id> --thread-id <thread_id> --answers '<interrupt id 到答案的 JSON 对象>' 恢复。"
+        )
+        return 3
+    answers = {}
+    for item in data["interrupts"]:
+        try:
+            raw = input(f"审批 {item['id']}（approve/reject，或 JSON 答案）：").strip()
+        except (EOFError, KeyboardInterrupt):
+            return 3
+        try:
+            answers[item["id"]] = json.loads(raw)
+        except json.JSONDecodeError:
+            answers[item["id"]] = raw
+    resume_payload = {
+        **payload,
+        "agent_id": data["agent_id"],
+        "thread_id": data["thread_id"],
+        "answers": answers,
+    }
+    resume_payload.pop("message", None)
+    return _chat_stream(
+        base_url,
+        resume_payload,
+        max_output_chars=max_output_chars,
+        path="/chat/resume/stream",
+    )
 
 
 def _interactive(args) -> int:
@@ -258,7 +345,9 @@ def _interactive(args) -> int:
                 thread_id=thread_id,
             )
             try:
-                ret = _chat_stream(base_url, payload, max_output_chars=args.max_output_chars)
+                ret = _chat_stream(
+                    base_url, payload, max_output_chars=args.max_output_chars
+                )
                 if ret != 0:
                     return ret
             except KeyboardInterrupt:
@@ -285,13 +374,36 @@ def main(argv: list[str] | None = None) -> int:
     serve_p.add_argument("--port", type=int, default=DEFAULT_PORT)
 
     chat_p = sub.add_parser("chat", help="调用本地 API 对话（不带 --msg 进入交互模式）")
-    chat_p.add_argument("--msg", "--message", dest="message", default=None, help="用户消息（不带则进入交互模式；交互默认流式输出）")
-    chat_p.add_argument("--stream", action="store_true", help="流式输出（SSE）；交互模式恒为流式")
+    chat_p.add_argument(
+        "--msg",
+        "--message",
+        dest="message",
+        default=None,
+        help="用户消息（不带则进入交互模式；交互默认流式输出）",
+    )
+    chat_p.add_argument("--resume", action="store_true", help="恢复待审批会话")
+    chat_p.add_argument("--agent-id", default=None, help="待恢复的 agent 身份")
+    chat_p.add_argument(
+        "--answers", default="{}", help="interrupt id 到审批答案的 JSON 对象"
+    )
+    chat_p.add_argument(
+        "--stream", action="store_true", help="流式输出（SSE）；交互模式恒为流式"
+    )
     chat_p.add_argument("--model", default=None, help="模型名，默认服务端配置")
     chat_p.add_argument("--provider", default=None, help="provider，默认服务端配置")
     chat_p.add_argument("--protocol", default=None, help="protocol，默认服务端配置")
-    chat_p.add_argument("--thread-id", default=None, help="多轮对话线程 id（交互模式缺省自动生成 cli-xxxx）")
-    chat_p.add_argument("--max-output-chars", type=int, default=DEFAULT_MAX_OUTPUT_CHARS, dest="max_output_chars", help="工具结果展示截断上限（≤0 不截断）")
+    chat_p.add_argument(
+        "--thread-id",
+        default=None,
+        help="多轮对话线程 id（交互模式缺省自动生成 cli-xxxx）",
+    )
+    chat_p.add_argument(
+        "--max-output-chars",
+        type=int,
+        default=DEFAULT_MAX_OUTPUT_CHARS,
+        dest="max_output_chars",
+        help="工具结果展示截断上限（≤0 不截断）",
+    )
     chat_p.add_argument("--base-url", default=f"http://{DEFAULT_HOST}:{DEFAULT_PORT}")
 
     args = parser.parse_args(argv)

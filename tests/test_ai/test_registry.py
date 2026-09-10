@@ -11,6 +11,7 @@ from lang_agent.ai.errors import (
 
 
 def test_build_deepseek_chat_response(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     llm = get_llm(model="deepseek-v4-flash", provider="deepseek", protocol="chat_response")
     assert isinstance(llm, BaseChatModel)

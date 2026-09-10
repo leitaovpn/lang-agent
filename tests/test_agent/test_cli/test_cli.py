@@ -290,3 +290,27 @@ def test_main_passes_max_output_chars_arg(monkeypatch):
     monkeypatch.setattr(cli_main, "_chat_stream", fake_stream)
     assert main(["chat", "--msg", "hi", "--stream", "--max-output-chars", "123"]) == 0
     assert seen["max_output_chars"] == 123
+
+
+def test_cli_interrupt_keeps_pending_in_script_mode(monkeypatch, capsys):
+    monkeypatch.setattr(cli_main.sys.stdin, 'isatty', lambda: False)
+    _mock_httpx_sse(monkeypatch, [('interrupt', {'agent_id': 'a', 'thread_id': 't', 'interrupts': [{'id': 'i', 'value': {'question': '审批'}}]})])
+    assert cli_main._chat_stream('http://test', {'message': '问'}) == 3
+    assert '--resume' in capsys.readouterr().out
+
+
+def test_cli_resume_sends_answers(monkeypatch):
+    sent = []
+    def stream(base_url, payload, **kwargs):
+        sent.append((payload, kwargs['path']))
+        return 0
+    monkeypatch.setattr(cli_main, '_chat_stream', stream)
+    assert main(['chat', '--resume', '--agent-id', 'a', '--thread-id', 't', '--answers', '{"i":"approve"}']) == 0
+    assert sent[0][0]['answers'] == {'i': 'approve'}
+    assert sent[0][1] == '/chat/resume/stream'
+
+
+def test_cli_corrects_provisional_final_text(monkeypatch, capsys):
+    _mock_httpx_sse(monkeypatch, [('llm_token', {'text': '原文'}), ('done', {'final_text': '审核后'})])
+    assert cli_main._chat_stream('http://test', {'message': '问'}) == 0
+    assert capsys.readouterr().out.endswith('最终回答：\n审核后\n')

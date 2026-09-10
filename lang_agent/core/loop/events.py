@@ -49,6 +49,9 @@ class ConversationResult:
     final_text: str
     messages: list[BaseMessage] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    status: str = "completed"
+    interrupts: list[dict[str, Any]] = field(default_factory=list)
+    agent_id: str = ""
 
 
 def classify_message_chunk(
@@ -59,6 +62,8 @@ def classify_message_chunk(
     thinking 增量位于 chunk.additional_kwargs["reasoning_content"]（deepseek 系
     模型流式行为）；后续内容（content）走 llm_token。
     """
+    if metadata.get("plugin_model_role") not in (None, "primary"):
+        return None
     if metadata.get("langgraph_node") != "agent":
         return None
     if not isinstance(chunk, AIMessageChunk):

@@ -107,3 +107,25 @@ async def test_stream_endpoint_sse(client, override_deps):
     assert "event: tool_result" in body
     assert "event: done" in body
     assert "结果是 56" in body
+
+
+async def test_http_approval_resume(client):
+    from lang_agent.core.plugin import PluginRegistry
+    from lang_agent.core.plugin.approval import ToolApprovalPlugin
+    loop = AgentLoop()
+    registry = PluginRegistry()
+    registry.register(ToolApprovalPlugin(), agent_id=loop.agent_id, hooks=['before_tool'])
+    loop.update_plugin_hooks(registry.snapshot(agent_id=loop.agent_id))
+    deps = ChatDeps(session=ChatSession(loop=loop), context=AgentContext(llm=FakeChatModel(responses=[AIMessage(content='', tool_calls=[TOOL_CALL]), AIMessage(content='完成')]), tools=instantiate_tools()))
+    from lang_agent.agent.server.app import build_resume_deps
+    app.dependency_overrides[build_resume_deps] = lambda: deps
+    app.dependency_overrides[build_deps] = lambda: deps
+    try:
+        response = await client.post('/chat', json={'message': '算一下'})
+        data = response.json()
+        assert data['status'] == 'interrupted'
+        response = await client.post('/chat/resume', json={'agent_id': loop.agent_id, 'answers': {data['interrupts'][0]['id']: 'approve'}})
+        assert response.status_code == 200
+        assert response.json()['answer'] == '完成'
+    finally:
+        app.dependency_overrides.clear()

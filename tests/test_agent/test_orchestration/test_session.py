@@ -258,7 +258,7 @@ async def test_repair_persists_to_checkpoint():
     await session.invoke("算两个", thread_id="t1", context=ctx)
     await session.invoke("谢谢", thread_id="t1", context=ctx)
 
-    state = await session.loop.graph.aget_state({"configurable": {"thread_id": "t1"}})
+    state = await session.loop.graph.aget_state(session.run_config("t1"))
     messages = state.values["messages"]
     ai = next(m for m in messages if isinstance(m, AIMessage) and m.tool_calls)
     ids = [c["id"] for c in ai.tool_calls]
@@ -439,7 +439,7 @@ async def test_compress_writes_back_summary_and_removes_old_rounds():
         await session.invoke(q, thread_id="t1", context=ctx)
         # 第 4 轮入口才发生压缩（入口时历史 6 条 > keep_last 4）
 
-    state = await session.loop.graph.aget_state({"configurable": {"thread_id": "t1"}})
+    state = await session.loop.graph.aget_state(session.run_config("t1"))
     values = state.values
     assert values.get("summary") == "早期摘要内容"
     contents = [m.content for m in values["messages"] if isinstance(m, (HumanMessage, AIMessage))]
@@ -474,7 +474,7 @@ async def test_compress_falls_back_to_dialogue_llm_as_summarizer():
     ctx = AgentContext(llm=llm, tools=instantiate_tools())
     for q in ["问1", "问2", "问3", "问4"]:
         await session.invoke(q, thread_id="t1", context=ctx)
-    state = await session.loop.graph.aget_state({"configurable": {"thread_id": "t1"}})
+    state = await session.loop.graph.aget_state(session.run_config("t1"))
     assert state.values.get("summary") == "对话llm做的摘要"
 
 
@@ -492,7 +492,7 @@ async def test_compress_keeps_repair_invariant():
 
     from lang_agent.core.loop.repair import repair_state_for_checkpoint
 
-    state = await session.loop.graph.aget_state({"configurable": {"thread_id": "t1"}})
+    state = await session.loop.graph.aget_state(session.run_config("t1"))
     messages = list(state.values["messages"])
     assert repair_state_for_checkpoint(messages) == messages  # 压缩后历史仍满足不变式
 
@@ -507,7 +507,7 @@ async def test_compress_skipped_below_threshold():
     ctx = make_ctx(llm)
     await session.invoke("问1", thread_id="t1", context=ctx)
     await session.invoke("问2", thread_id="t1", context=ctx)
-    state = await session.loop.graph.aget_state({"configurable": {"thread_id": "t1"}})
+    state = await session.loop.graph.aget_state(session.run_config("t1"))
     assert (state.values.get("summary") or "") == ""
     contents = [m.content for m in state.values["messages"] if isinstance(m, (HumanMessage, AIMessage))]
     assert contents == ["问1", "答1", "问2", "答2"]
@@ -524,7 +524,7 @@ async def test_compress_uses_dedicated_summarizer():
     ctx = AgentContext(llm=llm, tools=instantiate_tools(), summarizer_llm=summarizer)
     for q in ["问1", "问2", "问3", "问4"]:
         await session.invoke(q, thread_id="t1", context=ctx)
-    state = await session.loop.graph.aget_state({"configurable": {"thread_id": "t1"}})
+    state = await session.loop.graph.aget_state(session.run_config("t1"))
     assert state.values.get("summary") == "独立摘要"
     assert summarizer.seen_messages  # 独立摘要模型承担了摘要
     assert len(llm.seen_messages) == 4  # 对话 llm 未被摘要调用消耗

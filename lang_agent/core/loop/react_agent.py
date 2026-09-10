@@ -1,10 +1,10 @@
 """core 层：ReAct agent loop 的纯 graph 薄封装。
 
 拓扑：
-    START → agent（LLM + bind_tools，流式合并）
-              ├─ 无 tool_calls → END
-              ├─ 只有 invalid_tool_calls（已附错误反馈）→ agent（重试）
-              └─ 有 tool_calls → tools（ToolNode 执行真实工具）→ agent（回环）
+    START → before_agent → before_model → agent → after_model
+              ├─ 完成 → after_agent → END
+              ├─ invalid/重试 → before_model
+              └─ 工具调用 → before_tool → tools → after_tool → before_model
 
 AgentLoop 只负责构建与编译 graph；invoke/stream 与 `graph.ainvoke/astream`
 完全同形透传（输入/输出均不塑形）。llm/tools 每次 run 经 `context=` 注入
@@ -18,11 +18,14 @@ aget_state/aupdate_state 实现。
 globals 求值 AgentState 的 `Annotated[...]` 注解，字符串化会导致 NameError
 （1.2.11 仍是该求值机制）。
 """
+
+import copy
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, TypedDict, cast
+from typing import Annotated, Any, NotRequired, TypedDict, cast
+from uuid import uuid4
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
@@ -45,6 +48,17 @@ from langgraph.prebuilt.tool_node import ToolCallWrapper
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, ConfigDict
 
+from lang_agent.core.plugin import (
+    ModelRequest,
+    ModelResponse,
+    PluginError,
+    PluginSpecSnapshot,
+)
+from lang_agent.core.plugin.graph import merge_namespaces
+from lang_agent.core.plugin.runtime import CompiledPluginBundle, PluginRuntime
+from lang_agent.core.plugin.types import NODE_HOOKS
+from lang_agent.core.plugin.wrappers import call_sync_wrapper, compose_wrappers
+
 from .compress import truncate_tool_outputs
 from .repair import INVALID_ID_PREFIX
 
@@ -58,6 +72,11 @@ class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     system: str
     raw_input: str
+    agent_id: NotRequired[str]
+    run_id: NotRequired[str]
+    plugin_revision: NotRequired[str]
+    plugin_state: Annotated[dict[str, dict[str, Any]], merge_namespaces]
+    model_route_override: NotRequired[str | None]
     summary: str  # 早期对话摘要（context 压缩写回；发送时作为 SystemMessage 前缀）
 
 
@@ -87,6 +106,8 @@ class AgentContext(BaseModel):
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+    agent_id: str | None = None
+    plugin_bundle: Any = None
     llm: BaseChatModel
     tools: list[BaseTool]
     summarizer_llm: BaseChatModel | None = None  # context 压缩的摘要模型，缺省复用 llm
@@ -105,12 +126,14 @@ class AgentLoopConfig:
     # core 消费：默认 agent 节点构造时闭包捕获（构造后改配置不生效）
     compress_tool_output_max_chars: int = 2000  # 发送视图工具输出截断上限
     # agent 层消费：_run_config
-    recursion_limit: int = 25
+    recursion_limit: int = 80
     # agent 层消费：graph 调用异常重试（瞬时异常白名单 + 指数退避）
     retry_max_attempts: int = 3  # 总尝试次数（含首次）
     retry_base_delay: float = 0.5  # 首次退避秒数
     retry_backoff_factor: float = 2.0  # 指数退避因子
-    retryable_exceptions: tuple[type[BaseException], ...] | None = None  # None → 默认白名单（见 core/retry.py）
+    retryable_exceptions: tuple[type[BaseException], ...] | None = (
+        None  # None → 默认白名单（见 core/retry.py）
+    )
     # agent 层消费：context 压缩（摘要 + 保留窗口 + 工具输出截断，见 core/compress.py）
     compress_enabled: bool = True
     compress_token_threshold: int = 8000  # 估算 token 超此阈值触发压缩
@@ -139,82 +162,125 @@ def build_default_agent_node(compress_tool_output_max_chars: int = 2000) -> ReAc
         state: AgentState, config: RunnableConfig, runtime: Runtime[AgentContext]
     ) -> dict[str, list[BaseMessage]]:
         context = cast(AgentContext, runtime.context)
-        model = context.llm.bind_tools(context.tools)
         # 发送视图：system 提示 + 摘要前缀 + 截断后的历史（截断不写回 checkpoint）
-        messages: list[BaseMessage] = list(state["messages"])
+        messages: list[BaseMessage] = copy.deepcopy(list(state["messages"]))
         prefix: list[BaseMessage] = []
         if state.get("system"):
             prefix.append(SystemMessage(content=state["system"]))
         if state.get("summary"):
             prefix.append(SystemMessage(content="早期对话摘要:\n" + state["summary"]))
-        messages = truncate_tool_outputs(prefix + messages, compress_tool_output_max_chars)
-        chunks: list[BaseMessageChunk] = []
-        async for chunk in model.astream(messages, config=config):
-            chunks.append(cast(BaseMessageChunk, chunk))
-        if not chunks:
-            return {"messages": []}
-        merged = cast(AIMessageChunk, chunks[0])
-        for other in chunks[1:]:
-            merged = merged + cast(AIMessageChunk, other)
-        # langchain-core 1.x：chunk 合并（add_ai_message_chunks）会用合并后的
-        # tool_call_chunks 重新构造 chunk，触发 init_tool_calls 校验器——它对
-        # 残缺 args 宽容解析为 {}，把 invalid_tool_calls 误判为合法 tool_calls
-        # （0.3.x 无此行为）。tool_call_chunks 保留原始 args 字符串，这里用严格
-        # json 解析重建合法/非法判定（合法调用的最终 args 必为完整 JSON）。
-        tool_calls: list[dict[str, Any]] = []
-        invalid_tool_calls: list[dict[str, Any]] = []
-        for raw in merged.tool_call_chunks:
-            name = raw.get("name") or ""
-            args_raw = raw.get("args")
-            if isinstance(args_raw, dict):
-                args: Any = args_raw
-            elif args_raw:
-                try:
-                    args = json.loads(args_raw)
-                except json.JSONDecodeError:
-                    args = None
-            else:
-                args = {}
-            if isinstance(args, dict):
-                tool_calls.append(
-                    {"name": name, "args": args, "id": raw.get("id"), "type": "tool_call"}
-                )
-            else:
-                invalid_tool_calls.append(
-                    {
-                        "name": name,
-                        "args": args_raw or "",
-                        "id": raw.get("id"),
-                        "type": "invalid_tool_call",
-                        "error": None,
-                    }
-                )
-        # 转成普通 AIMessage 返回：AIMessageChunk（无论合并与否）经 checkpointer
-        # 序列化往返同样会触发 init_tool_calls 重建造成误判，普通 AIMessage
-        # 无此校验器，invalid_tool_calls 可原样往返。
-        # invalid 的 id 用确定性 invalid_<aimessage下标>_<条内序号>：agent_node
-        # 合成反馈 ToolMessage 与 repair 层必须一致，且 feedback ToolMessage 的
-        # tool_call_id 必须等于 _convert_message_to_dict 发给 API 的 tool_calls id
-        # （invalid_tool_calls 会被序列化为 tool_calls 发送）——原始 id（call_9 之类）
-        # 会造成「tool_calls 后缺匹配 ToolMessage」，deepseek 校验报 400。
-        base_index = len(state["messages"])
-        for k, invalid in enumerate(invalid_tool_calls or []):
-            invalid = dict(invalid)
-            invalid["id"] = f"{INVALID_ID_PREFIX}{base_index}_{k}"
-            invalid_tool_calls[k] = invalid
-        message = AIMessage(
-            content=merged.content,
-            tool_calls=tool_calls,
-            invalid_tool_calls=invalid_tool_calls,
-            additional_kwargs=merged.additional_kwargs,
-            response_metadata=merged.response_metadata,
-            usage_metadata=merged.usage_metadata,
-            id=merged.id,
-            name=merged.name,
+        messages = truncate_tool_outputs(
+            prefix + messages, compress_tool_output_max_chars
         )
+
+        async def terminal(request: ModelRequest) -> ModelResponse:
+            if any(tool not in context.tools for tool in request.tools):
+                raise PluginError("模型请求包含 context.tools 之外的工具")
+            model = request.llm.bind_tools(request.tools)
+            chunks: list[BaseMessageChunk] = []
+            async for chunk in model.astream(
+                request.messages,
+                config={
+                    **request.config,
+                    "metadata": {
+                        **request.config.get("metadata", {}),
+                        "plugin_model_role": "primary",
+                    },
+                },
+            ):
+                chunks.append(cast(BaseMessageChunk, chunk))
+            if not chunks:
+                return ModelResponse(None)
+            merged = cast(AIMessageChunk, chunks[0])
+            for other in chunks[1:]:
+                merged = merged + cast(AIMessageChunk, other)
+            # langchain-core 1.x：chunk 合并（add_ai_message_chunks）会用合并后的
+            # tool_call_chunks 重新构造 chunk，触发 init_tool_calls 校验器——它对
+            # 残缺 args 宽容解析为 {}，把 invalid_tool_calls 误判为合法 tool_calls
+            # （0.3.x 无此行为）。tool_call_chunks 保留原始 args 字符串，这里用严格
+            # json 解析重建合法/非法判定（合法调用的最终 args 必为完整 JSON）。
+            tool_calls: list[dict[str, Any]] = []
+            invalid_tool_calls: list[dict[str, Any]] = []
+            for raw in merged.tool_call_chunks:
+                name = raw.get("name") or ""
+                args_raw = raw.get("args")
+                if isinstance(args_raw, dict):
+                    args: Any = args_raw
+                elif args_raw:
+                    try:
+                        args = json.loads(args_raw)
+                    except json.JSONDecodeError:
+                        args = None
+                else:
+                    args = {}
+                if isinstance(args, dict):
+                    tool_calls.append(
+                        {
+                            "name": name,
+                            "args": args,
+                            "id": raw.get("id"),
+                            "type": "tool_call",
+                        }
+                    )
+                else:
+                    invalid_tool_calls.append(
+                        {
+                            "name": name,
+                            "args": args_raw or "",
+                            "id": raw.get("id"),
+                            "type": "invalid_tool_call",
+                            "error": None,
+                        }
+                    )
+            # 转成普通 AIMessage 返回：AIMessageChunk（无论合并与否）经 checkpointer
+            # 序列化往返同样会触发 init_tool_calls 重建造成误判，普通 AIMessage
+            # 无此校验器，invalid_tool_calls 可原样往返。
+            # invalid 的 id 用确定性 invalid_<aimessage下标>_<条内序号>：agent_node
+            # 合成反馈 ToolMessage 与 repair 层必须一致，且 feedback ToolMessage 的
+            # tool_call_id 必须等于 _convert_message_to_dict 发给 API 的 tool_calls id
+            # （invalid_tool_calls 会被序列化为 tool_calls 发送）——原始 id（call_9 之类）
+            # 会造成「tool_calls 后缺匹配 ToolMessage」，deepseek 校验报 400。
+            base_index = len(state["messages"])
+            for k, invalid in enumerate(invalid_tool_calls or []):
+                invalid = dict(invalid)
+                invalid["id"] = f"{INVALID_ID_PREFIX}{base_index}_{k}"
+                invalid_tool_calls[k] = invalid
+            message = AIMessage(
+                content=merged.content,
+                tool_calls=tool_calls,
+                invalid_tool_calls=invalid_tool_calls,
+                additional_kwargs=merged.additional_kwargs,
+                response_metadata=merged.response_metadata,
+                usage_metadata=merged.usage_metadata,
+                id=merged.id,
+                name=merged.name,
+            )
+            return ModelResponse(message)
+
+        entries = (
+            context.plugin_bundle.snapshot.registrations
+            if context.plugin_bundle
+            else ()
+        )
+        request = ModelRequest(
+            context.llm, list(context.tools), messages, config, runtime
+        )
+        response = await compose_wrappers(entries, "wrap_model_hook", terminal)(request)
+        if not isinstance(response, ModelResponse):
+            raise PluginError("模型 wrapper 必须返回 ModelResponse")
+        if response.message is None:
+            # 空短路也是本次模型决策，避免沿用上一条 tool_calls 重复执行工具。
+            return {"messages": [AIMessage(content="")]}
+        if not isinstance(response.message, AIMessage) or isinstance(
+            response.message, AIMessageChunk
+        ):
+            raise PluginError("模型响应必须是普通 AIMessage")
+        message = AIMessage.model_validate(response.message.model_dump())
+        for k, invalid_call in enumerate(message.invalid_tool_calls):
+            invalid_call["id"] = f"{INVALID_ID_PREFIX}{len(state['messages'])}_{k}"
         result: list[BaseMessage] = [message]
-        if not message.tool_calls:
-            # 无合法调用：为解析失败的调用附错误反馈 ToolMessage，驱动循环重试。
+        if message.invalid_tool_calls:
+            # 解析失败：为解析失败的调用附错误反馈 ToolMessage，驱动循环重试。
             # 注意 invalid_tool_calls 在 AImessage 里的 id 已被重写为确定性 id
             # （与 repair 层统一），这里直接用 message.invalid_tool_calls 的 id。
             for raw_invalid in message.invalid_tool_calls or []:
@@ -237,19 +303,72 @@ def build_default_tools_node() -> ReActNode:
     必须显式 handle_tool_errors=True：1.x 默认只把 ToolInvocationError 转
     错误 ToolMessage，其余工具异常直接上抛；显式 True 恢复 0.6.x 语义
     （任何工具异常 → 错误 ToolMessage 投喂 LLM，循环继续）。
-    context.wrap_tool_call 存在时传入 ToolNode（工具拦截：重试/缓存/鉴权）。
+    插件与旧 context.wrap_tool_call 合成为异步 wrapper，兼容仅异步工具。
     """
 
     async def tools_node(
         state: AgentState, config: RunnableConfig, runtime: Runtime[AgentContext]
     ) -> dict[str, list[BaseMessage]]:
         context = cast(AgentContext, runtime.context)
+        entries = (
+            context.plugin_bundle.snapshot.registrations
+            if context.plugin_bundle
+            else ()
+        )
+        plugin_names = tuple(r.name for r in entries)
+        contract_errors: list[PluginError] = []
+
+        async def wrapper(request, execute):
+            from lang_agent.core.plugin.approval import enforce_approval
+            from lang_agent.core.plugin.tool_validation import validate_tool_result
+
+            original_id = request.tool_call["id"]
+            request = request.override(
+                tool_call=copy.deepcopy(request.tool_call), state=copy.deepcopy(state)
+            )
+            denial = enforce_approval(state, request, plugin_names=plugin_names)
+            if denial is not None:
+                return denial
+
+            async def terminal(req):
+                enforce_approval(state, req, plugin_names=plugin_names, executing=True)
+                if req.tool_call.get("id") != original_id:
+                    raise PluginError("wrapper 不能修改 tool_call_id")
+                named = next(
+                    (t for t in context.tools if t.name == req.tool_call["name"]), None
+                )
+                if req.tool_call["name"] != request.tool_call["name"] and named is None:
+                    raise PluginError("wrapper 指定了未注册的工具")
+                req = req.override(tool=named)
+                return await execute(req)
+
+            async def legacy(req):
+                if context.wrap_tool_call:
+                    return await call_sync_wrapper(
+                        context.wrap_tool_call, req, terminal
+                    )
+                return await terminal(req)
+
+            result = await compose_wrappers(entries, "wrap_tool_hook", legacy)(request)
+            validate_tool_result(result, original_id)
+            return result
+
+        async def checked_wrapper(request, execute):
+            try:
+                return await wrapper(request, execute)
+            except PluginError as exc:
+                contract_errors.append(exc)
+                raise
+
         tool_node = ToolNode(
             context.tools,
             handle_tool_errors=True,
-            wrap_tool_call=context.wrap_tool_call,
+            awrap_tool_call=checked_wrapper,
         )
-        return await tool_node.ainvoke(state, config)
+        result = await tool_node.ainvoke(state, config)
+        if contract_errors:
+            raise contract_errors[0]
+        return result
 
     return tools_node
 
@@ -297,7 +416,15 @@ class AgentLoop:
         config: AgentLoopConfig | None = None,
         agent_node: ReActNode | None = None,
         tools_node: ReActNode | None = None,
+        node_wrap_hooks: frozenset[str] = frozenset(),
     ) -> None:
+        self._agent_id = uuid4().hex
+        self._plugins = PluginRuntime(self._agent_id)
+        self._custom_agent = agent_node is not None
+        self._custom_tools = tools_node is not None
+        if node_wrap_hooks - {"wrap_model_hook", "wrap_tool_hook"}:
+            raise PluginError("未知自定义节点 wrap 能力")
+        self._node_wrap_hooks = node_wrap_hooks
         self._config = config or AgentLoopConfig()
         if checkpointer is not None:
             self._checkpointer = checkpointer
@@ -321,16 +448,138 @@ class AgentLoop:
         self, agent_node: ReActNode, tools_node: ReActNode
     ) -> CompiledStateGraph[AgentState, AgentContext, AgentState, AgentState]:
         graph = StateGraph(AgentState, context_schema=AgentContext)
+
         # runtime 注入在 langgraph 类型定义之外（运行时已验证），类型检查忽略
-        graph.add_node(AGENT_NODE, agent_node)  # type: ignore
-        graph.add_node(TOOLS_NODE, tools_node)  # type: ignore
-        graph.add_edge(START, AGENT_NODE)
-        graph.add_conditional_edges(AGENT_NODE, should_continue)
-        graph.add_edge(TOOLS_NODE, AGENT_NODE)
+        def guarded(node):
+            async def execute(
+                state: AgentState,
+                config: RunnableConfig,
+                runtime: Runtime[AgentContext],
+            ):
+                self._plugins.validate(state, runtime.context)
+                return await node(state, config, runtime)
+
+            return execute
+
+        graph.add_node(AGENT_NODE, guarded(agent_node))
+        graph.add_node(TOOLS_NODE, guarded(tools_node))
+        for hook in NODE_HOOKS:
+
+            def dispatcher(name):
+                async def execute(
+                    state: AgentState,
+                    config: RunnableConfig,
+                    runtime: Runtime[AgentContext],
+                ):
+                    return await self._plugins.dispatch(
+                        name, state, config, runtime.context
+                    )
+
+                return execute
+
+            graph.add_node(hook, dispatcher(hook))
+        graph.add_edge(START, "before_agent")
+        graph.add_edge("before_agent", "before_model")
+        graph.add_edge("before_model", AGENT_NODE)
+        graph.add_edge(AGENT_NODE, "after_model")
+
+        def route(state: AgentState):
+            override = state.get("model_route_override")
+            if override:
+                return "before_model" if override == "retry" else "after_agent"
+            return {
+                AGENT_NODE: "before_model",
+                TOOLS_NODE: "before_tool",
+                END: "after_agent",
+            }[should_continue(state)]
+
+        graph.add_conditional_edges(
+            "after_model", route, ["before_model", "before_tool", "after_agent"]
+        )
+        graph.add_edge("before_tool", TOOLS_NODE)
+        graph.add_edge(TOOLS_NODE, "after_tool")
+        graph.add_edge("after_tool", "before_model")
+        graph.add_edge("after_agent", END)
         return graph.compile(checkpointer=self._checkpointer)
 
     @property
-    def graph(self) -> CompiledStateGraph[AgentState, AgentContext, AgentState, AgentState]:
+    def agent_id(self) -> str:
+        """新建时生成、跨轮次不变的 agent 身份。"""
+        return self._agent_id
+
+    @classmethod
+    def restore(cls, *, agent_id: str, **kwargs: Any) -> "AgentLoop":
+        """从受信任的持久定义恢复既有身份；插件历史快照需重新装载。"""
+        if not agent_id:
+            raise ValueError("agent_id 不能为空")
+        loop = cls(**kwargs)
+        loop._agent_id = agent_id
+        loop._plugins = PluginRuntime(agent_id)
+        return loop
+
+    @property
+    def plugin_revision(self) -> str:
+        return self._plugins.get().revision
+
+    def update_plugin_hooks(
+        self, snapshot: PluginSpecSnapshot, *, expected_revision: str | None = None
+    ):
+        for registration in snapshot.registrations:
+            if (
+                self._custom_agent
+                and "wrap_model_hook" not in self._node_wrap_hooks
+                and registration.hook("wrap_model_hook")
+            ):
+                raise PluginError("自定义 agent_node 未声明 wrap_model 能力")
+            if (
+                self._custom_tools
+                and "wrap_tool_hook" not in self._node_wrap_hooks
+                and registration.hook("wrap_tool_hook")
+            ):
+                raise PluginError("自定义 tools_node 未声明 wrap_tool 能力")
+        return self._plugins.update(snapshot, expected_revision)
+
+    def describe_plugin_hooks(self, revision: str | None = None) -> dict[str, Any]:
+        bundle = self._plugins.get(revision)
+        return {
+            "agent_id": self.agent_id,
+            "revision": bundle.revision,
+            "hooks": {
+                hook: [
+                    {
+                        "plugin": r.name,
+                        "version": r.version,
+                        "sync": bool(binding.sync),
+                        "async": bool(binding.async_),
+                    }
+                    for r in bundle.snapshot.registrations
+                    if (binding := r.hook(hook)) is not None
+                ]
+                for hook in (*NODE_HOOKS, "wrap_model_hook", "wrap_tool_hook")
+            },
+        }
+
+    def validate_plugin_answers(
+        self, revision: str, interruptions: list[Any], answers: dict[str, Any]
+    ) -> None:
+        """提交 Command 前校验答案，防止无效答案污染持久恢复记录。"""
+        self._plugins.validate_answers(revision, interruptions, answers)
+
+    def bind_plugin_context(
+        self, context: AgentContext, *, revision: str | None = None
+    ) -> AgentContext:
+        _require_context(context)
+        if context.agent_id not in (None, self.agent_id):
+            raise PluginError("context 属于另一个 agent")
+        bundle: CompiledPluginBundle = self._plugins.get(revision)
+        return context.model_copy(
+            update={"agent_id": self.agent_id, "plugin_bundle": bundle}
+        )
+
+    @property
+    def graph(
+        self,
+    ) -> CompiledStateGraph[AgentState, AgentContext, AgentState, AgentState]:
         """暴露编译图：agent 层 checkpoint 修复/压缩/续跑需要 aget_state/aupdate_state。"""
         return self._graph
 
