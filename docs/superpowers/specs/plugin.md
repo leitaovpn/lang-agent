@@ -1,7 +1,7 @@
 # 设计：core + plugin hook
 
 日期：2026-09-10  
-状态：首版已实现（2026-09-10）；实施差异和验证记录见第 14 节
+状态：首版已实现（2026-09-10）；实施差异和验证记录见第 14 节；二次修订（移除节点注入、plugin 包上移）见第 15 节
 
 ## 1. 目标与关键决策
 
@@ -489,7 +489,7 @@ HTTP/CLI 改动作为本方案的审批交付阶段；仅 core 已支持 Command
 ### 10.1 模块组织
 
 ```text
-lang_agent/core/
+lang_agent/
 ├── plugin/
 │   ├── __init__.py       # 显式导出基础协议、注册表
 │   ├── types.py          # HookResult/Request/Response/快照规格等
@@ -497,24 +497,27 @@ lang_agent/core/
 │   ├── registry.py       # 注册、校验、依赖排序、生成规格快照
 │   ├── graph.py          # 内部 hook graph、增量组合
 │   ├── wrappers.py       # 调用链、同步异步桥接
-│   └── runtime.py        # bundle 编译、版本发布、描述
-└── loop/
-    ├── types.py          # 从 react_agent 提取 AgentState/AgentContext/ReActNode
+│   ├── runtime.py        # bundle 编译、版本发布、描述
+│   ├── approval.py       # 可选批量工具审批插件与强制检查
+│   └── tool_validation.py# 工具 wrapper 输出约束
+└── core/loop/
     ├── react_agent.py    # 固定主图、默认节点与插件接入
     └── ...
 ```
 
-避免 `core.plugin` 和 `core.loop.react_agent` 运行时互相 import：plugin 协议对 state/context 使用泛型或只读 Protocol，loop 定义具体 schema 并提供 reducer/校验适配器；`core.loop.types` 可引用 plugin 基础类型，plugin 不反向导入 loop 的包入口。
+plugin 是跨层的横向协议包（供 core.loop 与 agent 层使用），位于 `lang_agent/` 顶层而非 `core/` 之下。避免 plugin 与 loop 运行时互相 import：plugin 协议对 state/context 使用泛型或只读 Protocol，loop 定义具体 schema 并提供 reducer/校验适配器；plugin 不反向导入 loop 或 agent 的包入口。
 
-提取类型时处理 `core.loop.__init__` 的导入顺序，并验证 LangGraph 类型注入。`react_agent.py` 继续遵守禁止 `from __future__ import annotations` 的约定；类型移位不能丢失 State/Runtime 注解解析所需 globals。现有导出保持兼容。
+为避免类型重组影响既有注解解析，AgentState/AgentContext/ReActNode 继续留在 `react_agent.py`（见第 14 节首版实施记录），该文件遵守禁止 `from __future__ import annotations` 的约定；`core.loop.__init__` 的导出保持兼容。
 
-内置业务插件放在 agent 层的装配模块或独立业务包；core.plugin 不 import agent，不读取 HTTP 请求或环境配置。
+内置业务插件放在 agent 层的装配模块或独立业务包；plugin 包不 import agent，不读取 HTTP 请求或环境配置。
 
-### 10.2 默认节点与自定义节点
+### 10.2 固定默认节点
 
-六个生命周期调度节点始终包围注入的 `agent_node/tools_node`，所以自定义节点也拥有 node hook。
-
-wrap hook 由默认节点执行；自定义节点若要支持必须显式调用框架提供的 model/tool pipeline。构造/更新时提供明确 capability 声明：对未声明支持的自定义节点注册对应 wrap hook 直接报错，不允许悄悄忽略。
+主图固定使用内置默认节点（`build_default_agent_node` / `build_default_tools_node`），
+不支持注入自定义 `agent_node/tools_node`：自定义节点会旁路 wrap hook 的执行保证
+（capability 声明只解决「可检测」，解决不了「可绕过」），因此直接移除注入入口与
+`node_wrap_hooks` 能力声明。六个生命周期调度节点始终包围默认节点，hook 保证无旁路。
+自定义循环形态（如 plan-execute）应在 loop 包新增独立模块，而不是替换既有主图节点。
 
 ### 10.3 事件分类
 
@@ -564,7 +567,6 @@ wrap hook 由默认节点执行；自定义节点若要支持必须显式调用�
 | repair | 待审批/待执行 calls 不合成假反馈、历史损坏仍修复、恢复不会重复已执行工具 |
 | events | after hook 改写后的最终文本/工具结果、空 patch、缓存无 token、缓冲审核、interrupt 无 done |
 | 限制 | 同线程并发拒绝/串行、取消传播、hook 重放幂等、线程桥接无死锁、recursion_limit 边界 |
-| 扩展 | 自定义节点 node hook 有效；wrap capability 不匹配明确报错 |
 
 最低验收场景：注册 A/B → 完成一轮 → 同一 thread 暂停审批 → 发布删 B 加 C 的新版本 → 原轮按 A/B 完成 → 下一轮按 A/C 执行 → 历史消息完整、主图结构未变、无内部 hook checkpoint。
 
@@ -616,3 +618,22 @@ wrap hook 由默认节点执行；自定义节点若要支持必须显式调用�
 - 现有服务没有内置用户认证；agent_id 实现执行身份隔离，不是访问令牌。对外多用户部署由宿主接入认证/授权；本次不引入账号系统。
 
 验证覆盖：双函数单节点、注册依赖/事务回滚、版本及配置隔离、消息增删组合、同步 wrapper 调用仅异步工具、缓存短路和调用顺序、运行中更新、批内多次审批、拒绝/编辑、无效答案重提、缺失旧版本、sqlite 重启、共享 saver 隔离、旧历史迁移、失败任务恢复、取消、HTTP 与 CLI。完整门禁为 ruff、mypy 和全量 pytest；不调用真实 LLM API。
+
+## 15. 二次修订记录（2026-09-10）
+
+首版上线后发现两处需要收紧的设计，按本记录修订：
+
+- **移除节点注入**：`AgentLoop` 不再接受 `agent_node/tools_node/node_wrap_hooks`。
+  自定义节点会旁路 wrap hook 的执行保证——capability 声明只解决「可检测」，
+  解决不了「可绕过」。主图固定使用内置默认节点（`build_default_agent_node` /
+  `build_default_tools_node`），`ReActNode` 与两个工厂继续公开导出；自定义循环
+  形态（如 plan-execute）应新增独立模块而非替换既有主图节点。`update_plugin_hooks`
+  的 wrap 能力校验随之删除，注入相关测试（`test_injected_agent_node_is_used`、
+  `test_injected_tools_node_is_used`）删除。
+- **plugin 包上移到 `lang_agent/plugin/`**：plugin 是跨层横向协议包（core.loop 与
+  agent 层共同使用），放在 `core/` 之下名不副实；上移后依赖方向不变且更清晰：
+  loop → plugin 单向，plugin 不 import loop/agent。测试目录同步移动到
+  `tests/test_plugin/`。§10.1 的模块布局与 §10.2 已按修订重写。
+
+提交策略：先纯移动（git mv + import 更新，保留 rename 追踪），再删注入与文档同步；
+每个提交独立通过 ruff / mypy 双版交叉检查 / 全量 pytest。
