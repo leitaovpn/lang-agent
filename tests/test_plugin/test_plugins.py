@@ -414,6 +414,53 @@ async def test_buffered_after_hook_replaces_final_without_leaking_tokens():
     assert events[-1].data["final_text"] == "审核后"
 
 
+async def test_wrap_model_hook_auxiliary_model_stream_not_leaked():
+    """hook 内辅助模型流（无 primary 标记）不得外发 token 事件。"""
+    auxiliary = FakeChatModel(
+        responses=[
+            AIMessage(
+                content="辅助模型秘密文本",
+                additional_kwargs={"reasoning_content": "辅助思考"},
+            )
+        ]
+    )
+
+    class Aux(PluginBase):
+        name = "aux"
+
+        def __init__(self, model):
+            self.model = model
+
+        async def awrap_model_hook(self, request, handler):
+            # 复用 request.config 的同一回调树：辅助模型的流式 chunk 会进入
+            # messages 通道（langgraph_node="agent"、无 plugin_model_role 标记），
+            # 分类器必须拦截，只有主模型（primary）的 token 能外发。
+            async for _ in self.model.astream(
+                request.messages, config=request.config
+            ):
+                pass
+            return await handler(request)
+
+    loop = AgentLoop()
+    install(loop, (Aux(auxiliary), ["wrap_model_hook"]))
+    ctx = AgentContext(
+        llm=FakeChatModel(responses=[AIMessage(content="主模型最终文本")]), tools=[]
+    )
+    events = [
+        e async for e in ChatSession(loop=loop).stream("问", thread_id="t", context=ctx)
+    ]
+    # 辅助模型确实被调用（其流进入了 messages 通道），测试非空转
+    assert len(auxiliary.seen_messages) == 1
+    texts = "".join(e.data["text"] for e in events if e.type == "llm_token")
+    thinkings = "".join(
+        e.data["text"] for e in events if e.type == "thinking_token"
+    )
+    assert texts == "主模型最终文本"
+    assert "辅助模型秘密文本" not in texts
+    assert thinkings == ""
+    assert events[-1].data["final_text"] == "主模型最终文本"
+
+
 async def test_message_add_replace_remove_is_one_committed_delta():
     from langchain_core.messages import RemoveMessage
 

@@ -313,7 +313,7 @@ builder.add_node(f"{plugin.name}.before_model", node)
 
 上述 build_* 为本项目待实现的适配器，不是 LangGraph API。sync/async 适配器必须保持相同的参数名和类型注解：本地 RunnableCallable 从 `func or afunc` 的签名提取注入参数，不能让两种实现依赖不一致的注入约定。适配器接收 LangGraph Runtime 后显式构造 HookRuntime，不能直接把插件期望的 HookRuntime 当成框架注入的 Runtime。
 
-所有六组 node hook 采用同一构建流程。RunnableCallable 位于 LangGraph 的 `_internal` 模块，将该 import 集中在 `core/plugin/graph.py`，以锁定版本的行为测试约束后续依赖升级。
+所有六组 node hook 采用同一构建流程。RunnableCallable 位于 LangGraph 的 `_internal` 模块，将该 import 集中在 `lang_agent/plugin/graph.py`，以锁定版本的行为测试约束后续依赖升级。
 
 内部 graph 显式 `compile(checkpointer=False)`，调用时显式传入 context/config。保留 callbacks、trace 等运行信息，不伪造或随意删除 LangGraph 的私有配置字段。内部递归上限按 hook 数量单独设置，例如节点数量 + 固定余量，避免误用主图 25 步上限。
 

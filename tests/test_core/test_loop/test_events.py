@@ -26,31 +26,58 @@ def test_messages_after_last_human_without_human_returns_all():
 
 def test_token_from_agent_chunk():
     chunk = AIMessageChunk(content="你好")
-    event = classify_message_chunk(chunk, {"langgraph_node": "agent"})
+    event = classify_message_chunk(
+        chunk, {"langgraph_node": "agent", "plugin_model_role": "primary"}
+    )
     assert event == AgentEvent("llm_token", {"text": "你好"})
 
 
 def test_thinking_chunk_emits_thinking_token():
     chunk = AIMessageChunk(content="", additional_kwargs={"reasoning_content": "想"})
-    event = classify_message_chunk(chunk, {"langgraph_node": "agent"})
+    event = classify_message_chunk(
+        chunk, {"langgraph_node": "agent", "plugin_model_role": "primary"}
+    )
     assert event == AgentEvent("thinking_token", {"text": "想"})
 
 
 def test_thinking_then_content_chunks_classify_separately():
+    metadata = {"langgraph_node": "agent", "plugin_model_role": "primary"}
     chunk = AIMessageChunk(content="", additional_kwargs={"reasoning_content": "想"})
-    assert classify_message_chunk(chunk, {"langgraph_node": "agent"}).type == "thinking_token"
+    assert classify_message_chunk(chunk, metadata).type == "thinking_token"
     chunk2 = AIMessageChunk(content="答")
-    assert classify_message_chunk(chunk2, {"langgraph_node": "agent"}).type == "llm_token"
+    assert classify_message_chunk(chunk2, metadata).type == "llm_token"
 
 
 def test_chunk_from_tools_node_ignored():
     chunk = AIMessageChunk(content="56")
-    assert classify_message_chunk(chunk, {"langgraph_node": "tools"}) is None
+    assert (
+        classify_message_chunk(
+            chunk, {"langgraph_node": "tools", "plugin_model_role": "primary"}
+        )
+        is None
+    )
+
+
+def test_chunk_without_primary_role_ignored():
+    # hook 内辅助模型流继承 langgraph_node="agent" 但无 primary 标记，必须拦截
+    chunk = AIMessageChunk(content="辅助模型泄漏")
+    assert classify_message_chunk(chunk, {"langgraph_node": "agent"}) is None
+    assert (
+        classify_message_chunk(
+            chunk, {"langgraph_node": "agent", "plugin_model_role": "auxiliary"}
+        )
+        is None
+    )
 
 
 def test_empty_chunk_ignored():
     chunk = AIMessageChunk(content="")
-    assert classify_message_chunk(chunk, {"langgraph_node": "agent"}) is None
+    assert (
+        classify_message_chunk(
+            chunk, {"langgraph_node": "agent", "plugin_model_role": "primary"}
+        )
+        is None
+    )
 
 
 def test_agent_update_with_tool_calls_emits_tool_call():

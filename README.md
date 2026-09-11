@@ -251,7 +251,7 @@ result = await session.invoke("你好", thread_id="t1", context=AgentContext(llm
 
 `registry.replace/unregister/snapshot` 也需要 `agent_id`。修改注册表后调用 `loop.update_plugin_hooks(...)` 才生效；主图不重编译，每一轮及其重试/审批恢复绑定原插件版本，新版本从下一轮开始使用。配置变化应写入 `config` 并发布新实例/版本，不要把请求数据放进共享插件属性。
 
-使用 `loop.describe_plugin_hooks()` 查看身份、版本和各 hook 的绑定。自定义模型/工具节点默认只享有 node hook；显式声明 `node_wrap_hooks=frozenset({"wrap_model_hook"})` 后，节点实现还须调用默认节点工厂所提供的模型调用流程，才能执行对应 wrapper。
+使用 `loop.describe_plugin_hooks()` 查看身份、版本和各 hook 的绑定。主图固定使用内置默认节点（`build_default_agent_node` / `build_default_tools_node`），不支持注入自定义节点——注入会旁路 wrap hook 的执行保证，所以不提供该能力；自定义循环形态（如 plan-execute）应在 loop 包新增独立模块，而非替换既有主图节点。
 
 `ChatSession` 将 `(agent_id, thread_id)` 编码成内部 checkpoint key。手动读取 checkpoint 使用 `session.run_config("t1")`，不要使用裸 thread_id。直接调用 core graph 时，需自行使用隔离的 config，并通过 `loop.bind_plugin_context(context)` 及 initial state 的 `agent_id/plugin_revision/run_id` 固定本轮版本；invoke/stream 保持参数原样透传。
 

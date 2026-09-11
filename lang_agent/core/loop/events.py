@@ -61,8 +61,12 @@ def classify_message_chunk(
 
     thinking 增量位于 chunk.additional_kwargs["reasoning_content"]（deepseek 系
     模型流式行为）；后续内容（content）走 llm_token。
+
+    只放行 `plugin_model_role == "primary"` 的 chunk：模型 terminal 对主模型流
+    无条件打标（无插件模式也成立），hook 内用 request.config 调用的辅助模型流
+    没有该标记（但继承 langgraph_node="agent"），必须在此拦截，不得外发。
     """
-    if metadata.get("plugin_model_role") not in (None, "primary"):
+    if metadata.get("plugin_model_role") != "primary":
         return None
     if metadata.get("langgraph_node") != "agent":
         return None
